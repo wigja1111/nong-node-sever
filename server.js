@@ -10,7 +10,7 @@ import rateLimit from 'express-rate-limit';
 import bcrypt from 'bcryptjs';           // ✅ 네이티브 bcrypt 대신 bcryptjs
 import jwt from 'jsonwebtoken';
 import multer from 'multer';
-import { randomUUID } from 'crypto';
+import { randomUUID, createHash } from 'crypto';
 
 // -------------------- Config --------------------
 const cfg = {
@@ -43,7 +43,13 @@ const app = express();
 app.set('trust proxy', true);
 
 // 보안/기본 미들웨어
-app.use(helmet());
+app.use(
+  helmet({
+    // ✅ 이미지 등 리소스를 다른 오리진(프론트 도메인)에서 불러올 수 있게 허용
+    crossOriginResourcePolicy: { policy: 'cross-origin' },
+    // CSP는 기본 비활성(Helmet v7). 필요 시 명시 구성 가능.
+  })
+);
 app.use(cors({ origin: cfg.corsOrigin, credentials: false }));
 app.use(express.json({ limit: '1mb' }));
 
@@ -63,6 +69,11 @@ app.use((req, res, next) => {
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: cfg.maxImageSizeMB * 1024 * 1024, files: cfg.maxImageFiles },
+  fileFilter: (_req, file, cb) => {
+    // ✅ 이미지 외 차단(일부 환경서 mimetype 이상값 예방)
+    if (!file.mimetype?.startsWith('image/')) return cb(new Error('Only image uploads are allowed'));
+    cb(null, true);
+  },
 });
 
 // 응답 헬퍼
@@ -466,16 +477,23 @@ app.get('/posts/:id', async (req, res) => {
     );
     if (!post) return fail(res, 404, 'not found');
 
+    // ✅ 이미지 메타 + 접근 가능한 URL을 함께 반환 (프론트에서 그대로 <img src> 사용)
     const [imgs] = await conn.query(
       'SELECT img_id, img_mime, img_size, created_at FROM post_images WHERE img_post_id=? ORDER BY img_id ASC',
       [id]
     );
-    ok(res, { post, images: imgs });
+    const images = imgs.map((i) => ({
+      ...i,
+      img_url: `/posts/${id}/images/${i.img_id}`,
+      // 필요 시 절대 URL: `${req.protocol}://${req.get('host')}/posts/${id}/images/${i.img_id}`
+    }));
+    ok(res, { post, images });
   } finally {
     conn.release();
   }
 });
 
+// ✅ 단일 이미지 스트리밍(포스트 포함 경로)
 app.get('/posts/:id/images/:imgId', async (req, res) => {
   const id = Number(req.params.id);
   const imgId = Number(req.params.imgId);
@@ -483,17 +501,56 @@ app.get('/posts/:id/images/:imgId', async (req, res) => {
   const conn = await p.getConnection();
   try {
     const [[img]] = await conn.query(
-      'SELECT img_mime, img_data FROM post_images WHERE img_post_id=? AND img_id=?',
+      'SELECT img_mime, img_size, img_data, created_at FROM post_images WHERE img_post_id=? AND img_id=?',
       [id, imgId]
     );
     if (!img) return fail(res, 404, 'image not found');
+
+    // 헤더 정교화: 타입/길이/캐시/ETag
+    const buf = img.img_data; // Buffer
+    const etag = createHash('sha1').update(buf).digest('hex');
     res.setHeader('Content-Type', img.img_mime);
-    res.setHeader('Cache-Control', 'public, max-age=86400');
-    res.send(img.img_data);
+    res.setHeader('Content-Length', String(img.img_size || buf.length));
+    res.setHeader('Cache-Control', 'public, max-age=86400, immutable');
+    res.setHeader('ETag', etag);
+    res.setHeader('Last-Modified', new Date(img.created_at).toUTCString());
+
+    // If-None-Match 처리(간단 버전)
+    if (req.headers['if-none-match'] === etag) return res.status(304).end();
+
+    res.end(buf);
   } finally {
     conn.release();
   }
 });
+
+// ✅ 선택: 포스트 ID 없이도 접근 가능한 심플 경로 (원하면 프런트에서 이 경로 사용)
+// 주석 해제해서 쓰고 싶다면 위와 동일하게 유지하면 됨.
+/*
+app.get('/images/:imgId', async (req, res) => {
+  const imgId = Number(req.params.imgId);
+  const p = ensurePool();
+  const conn = await p.getConnection();
+  try {
+    const [[img]] = await conn.query(
+      'SELECT img_mime, img_size, img_data, created_at FROM post_images WHERE img_id=?',
+      [imgId]
+    );
+    if (!img) return fail(res, 404, 'image not found');
+    const buf = img.img_data;
+    const etag = createHash('sha1').update(buf).digest('hex');
+    res.setHeader('Content-Type', img.img_mime);
+    res.setHeader('Content-Length', String(img.img_size || buf.length));
+    res.setHeader('Cache-Control', 'public, max-age=86400, immutable');
+    res.setHeader('ETag', etag);
+    res.setHeader('Last-Modified', new Date(img.created_at).toUTCString());
+    if (req.headers['if-none-match'] === etag) return res.status(304).end();
+    res.end(buf);
+  } finally {
+    conn.release();
+  }
+});
+*/
 
 app.put(
   '/posts/:id',
