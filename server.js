@@ -7,10 +7,10 @@ import mysql from 'mysql2/promise';
 import helmet from 'helmet';
 import cors from 'cors';
 import rateLimit from 'express-rate-limit';
-import bcrypt from 'bcryptjs';           // ✅ 네이티브 bcrypt 대신 bcryptjs
+import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import multer from 'multer';
-import { randomUUID, createHash } from 'crypto';
+import { randomUUID } from 'crypto';
 
 // -------------------- Config --------------------
 const cfg = {
@@ -24,10 +24,9 @@ const cfg = {
   corsOrigin: process.env.CORS_ORIGIN || '*',
   maxImageSizeMB: Number(process.env.MAX_IMAGE_MB || 10),
   maxImageFiles: Number(process.env.MAX_IMAGE_FILES || 10),
-  jwtSecret: process.env.JWT_SECRET || 'dev-secret-change-it', // ✅ 추가/통일
+  jwtSecret: process.env.JWT_SECRET || 'dev-secret-change-it',
 };
 
-// 민감정보 제외 설정 로그
 console.log('[BOOT CONFIG]', {
   DB_HOST: cfg.dbHost,
   DB_PORT: cfg.dbPort,
@@ -42,18 +41,10 @@ console.log('[BOOT CONFIG]', {
 const app = express();
 app.set('trust proxy', true);
 
-// 보안/기본 미들웨어
-app.use(
-  helmet({
-    // ✅ 이미지 등 리소스를 다른 오리진(프론트 도메인)에서 불러올 수 있게 허용
-    crossOriginResourcePolicy: { policy: 'cross-origin' },
-    // CSP는 기본 비활성(Helmet v7). 필요 시 명시 구성 가능.
-  })
-);
+app.use(helmet());
 app.use(cors({ origin: cfg.corsOrigin, credentials: false }));
 app.use(express.json({ limit: '1mb' }));
 
-// 요청 ID + 간단 로깅
 app.use((req, res, next) => {
   const rid = randomUUID();
   req.rid = rid;
@@ -65,18 +56,11 @@ app.use((req, res, next) => {
   next();
 });
 
-// 업로드(메모리) — 파일시스템 저장 없이 DB(LONGBLOB)
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: cfg.maxImageSizeMB * 1024 * 1024, files: cfg.maxImageFiles },
-  fileFilter: (_req, file, cb) => {
-    // ✅ 이미지 외 차단(일부 환경서 mimetype 이상값 예방)
-    if (!file.mimetype?.startsWith('image/')) return cb(new Error('Only image uploads are allowed'));
-    cb(null, true);
-  },
 });
 
-// 응답 헬퍼
 const ok = (res, data = {}) => res.json({ ok: true, ...data });
 const fail = (res, code = 400, message = 'Bad Request') => res.status(code).json({ ok: false, error: message });
 
@@ -99,17 +83,14 @@ function ensurePool() {
     connectTimeout: 5000,
     enableKeepAlive: true,
     keepAliveInitialDelay: 0,
-    charset: 'utf8mb4', // ✅ 한국어/이모지 안전
-    // ssl: { rejectUnauthorized: false }, // (필요 시)
+    charset: 'utf8mb4',
   });
   return pool;
 }
 
 // -------------------- Diagnostics / Health --------------------
 app.get('/', (_req, res) => ok(res, { route: '/', node: process.version }));
-
 app.get('/health', (_req, res) => ok(res, { status: 'ok' }));
-
 app.get('/env-check', (_req, res) =>
   ok(res, {
     env: {
@@ -207,7 +188,6 @@ async function initSchema() {
   const p = ensurePool();
   const conn = await p.getConnection();
   try {
-    // DB/테이블 생성 (권한 없으면 실패할 수 있음)
     await conn.query(
       `CREATE DATABASE IF NOT EXISTS \`${cfg.dbName}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`
     );
@@ -243,6 +223,7 @@ async function initSchema() {
         \`post_cat_id\`   INT UNSIGNED NULL,
         \`post_content\`  TEXT NOT NULL,
         \`post_priority\` INT NOT NULL DEFAULT 0,
+        \`post_like\`     INT UNSIGNED NOT NULL DEFAULT 0,            -- ✅ 좋아요 수
         \`created_at\`    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
         \`updated_at\`    DATETIME NULL ON UPDATE CURRENT_TIMESTAMP,
         PRIMARY KEY (\`post_id\`),
@@ -286,6 +267,28 @@ async function initSchema() {
         CONSTRAINT \`fk_comments_root\`   FOREIGN KEY (\`cmt_thread_root_cmt_id\`) REFERENCES \`comments\`(\`cmt_id\`) ON DELETE SET NULL ON UPDATE CASCADE
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`
     );
+
+    // ✅ 새로 추가: 사용자 설정 (1:1)
+    await conn.query(
+      `CREATE TABLE IF NOT EXISTS \`user_setting\` (
+        \`uset_user_id\`      INT UNSIGNED NOT NULL,
+        \`uset_nickname\`     VARCHAR(50) NULL,
+        \`uset_notify_email\` TINYINT(1) NOT NULL DEFAULT 1,
+        \`uset_notify_push\`  TINYINT(1) NOT NULL DEFAULT 1,
+        \`created_at\`        DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        \`updated_at\`        DATETIME NULL ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (\`uset_user_id\`),
+        CONSTRAINT \`fk_user_setting_user\` FOREIGN KEY (\`uset_user_id\`)
+          REFERENCES \`users\`(\`user_id\`) ON DELETE CASCADE ON UPDATE CASCADE
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`
+    );
+
+    // ✅ 기존 DB엔 posts.post_like 없을 수 있어 보강 (중복 에러 무시)
+    try {
+      await conn.query('ALTER TABLE `posts` ADD COLUMN `post_like` INT UNSIGNED NOT NULL DEFAULT 0');
+    } catch (e) {
+      if (e?.code !== 'ER_DUP_FIELDNAME') throw e;
+    }
   } finally {
     conn.release();
   }
@@ -335,7 +338,7 @@ app.post('/auth/login', authLimiter, async (req, res) => {
     const { email, password } = req.body || {};
     if (!email || !password) return fail(res, 400, 'email/password required');
 
-    const p = ensurePool(); // ✅ 풀 보장
+    const p = ensurePool();
     const [rows] = await p.query(
       'SELECT user_id,user_name,user_email,user_password,user_role FROM users WHERE user_email=?',
       [email]
@@ -364,6 +367,53 @@ app.post('/auth/login', authLimiter, async (req, res) => {
   } catch (e) {
     console.error('[LOGIN ERROR]', e?.code || e?.message || String(e));
     return res.status(500).json({ ok: false, error: 'LOGIN_INTERNAL' });
+  }
+});
+
+// -------------------- User Setting APIs --------------------
+// 내 설정 조회
+app.get('/users/me/settings', authRequired, async (req, res) => {
+  const uid = Number(req.user.id ?? req.user.uid);
+  const p = ensurePool();
+  const conn = await p.getConnection();
+  try {
+    const [[row]] = await conn.query(
+      'SELECT uset_user_id, uset_nickname, uset_notify_email, uset_notify_push, created_at, updated_at FROM user_setting WHERE uset_user_id=?',
+      [uid]
+    );
+    ok(res, { setting: row || null });
+  } catch (e) {
+    console.error('[USER SETTING GET]', e);
+    fail(res, 500, 'failed');
+  } finally {
+    conn.release();
+  }
+});
+
+// 내 설정 저장(Upsert)
+app.put('/users/me/settings', authRequired, async (req, res) => {
+  const uid = Number(req.user.id ?? req.user.uid);
+  const { nickname, notify_email = 1, notify_push = 1 } = req.body || {};
+  if (nickname && String(nickname).length > 50) return fail(res, 400, 'nickname too long');
+
+  const p = ensurePool();
+  const conn = await p.getConnection();
+  try {
+    await conn.execute(
+      `INSERT INTO user_setting (uset_user_id, uset_nickname, uset_notify_email, uset_notify_push)
+       VALUES (?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         uset_nickname=VALUES(uset_nickname),
+         uset_notify_email=VALUES(uset_notify_email),
+         uset_notify_push=VALUES(uset_notify_push)`,
+      [uid, nickname ?? null, Number( notify_email ? 1 : 0 ), Number( notify_push ? 1 : 0 )]
+    );
+    ok(res, { saved: true });
+  } catch (e) {
+    console.error('[USER SETTING PUT]', e);
+    fail(res, 500, 'failed');
+  } finally {
+    conn.release();
   }
 });
 
@@ -443,7 +493,7 @@ app.get('/posts', async (req, res) => {
     let where = ' WHERE 1=1 ';
     if (cat_id) { where += ' AND post_cat_id=? '; params.push(Number(cat_id)); }
     const sql = `
-      SELECT p.post_id, p.post_content, p.post_priority, p.created_at, p.updated_at,
+      SELECT p.post_id, p.post_content, p.post_priority, p.post_like, p.created_at, p.updated_at,
              u.user_id, u.user_name, c.cat_id, c.cat_name
         FROM posts p
         LEFT JOIN users u ON u.user_id = p.post_user_id
@@ -477,80 +527,52 @@ app.get('/posts/:id', async (req, res) => {
     );
     if (!post) return fail(res, 404, 'not found');
 
-    // ✅ 이미지 메타 + 접근 가능한 URL을 함께 반환 (프론트에서 그대로 <img src> 사용)
     const [imgs] = await conn.query(
       'SELECT img_id, img_mime, img_size, created_at FROM post_images WHERE img_post_id=? ORDER BY img_id ASC',
       [id]
     );
-    const images = imgs.map((i) => ({
-      ...i,
-      img_url: `/posts/${id}/images/${i.img_id}`,
-      // 필요 시 절대 URL: `${req.protocol}://${req.get('host')}/posts/${id}/images/${i.img_id}`
-    }));
-    ok(res, { post, images });
+    ok(res, { post, images: imgs });
   } finally {
     conn.release();
   }
 });
 
-// ✅ 단일 이미지 스트리밍(포스트 포함 경로)
-app.get('/posts/:id/images/:imgId', async (req, res) => {
+// ✅ 좋아요 증가
+app.post('/posts/:id/like', authRequired, async (req, res) => {
   const id = Number(req.params.id);
-  const imgId = Number(req.params.imgId);
   const p = ensurePool();
   const conn = await p.getConnection();
   try {
-    const [[img]] = await conn.query(
-      'SELECT img_mime, img_size, img_data, created_at FROM post_images WHERE img_post_id=? AND img_id=?',
-      [id, imgId]
-    );
-    if (!img) return fail(res, 404, 'image not found');
-
-    // 헤더 정교화: 타입/길이/캐시/ETag
-    const buf = img.img_data; // Buffer
-    const etag = createHash('sha1').update(buf).digest('hex');
-    res.setHeader('Content-Type', img.img_mime);
-    res.setHeader('Content-Length', String(img.img_size || buf.length));
-    res.setHeader('Cache-Control', 'public, max-age=86400, immutable');
-    res.setHeader('ETag', etag);
-    res.setHeader('Last-Modified', new Date(img.created_at).toUTCString());
-
-    // If-None-Match 처리(간단 버전)
-    if (req.headers['if-none-match'] === etag) return res.status(304).end();
-
-    res.end(buf);
+    const [r] = await conn.execute('UPDATE posts SET post_like = post_like + 1 WHERE post_id=?', [id]);
+    if (r.affectedRows === 0) return fail(res, 404, 'not found');
+    ok(res, { liked: true });
+  } catch (e) {
+    console.error('[POST LIKE]', e);
+    fail(res, 500, 'failed');
   } finally {
     conn.release();
   }
 });
 
-// ✅ 선택: 포스트 ID 없이도 접근 가능한 심플 경로 (원하면 프런트에서 이 경로 사용)
-// 주석 해제해서 쓰고 싶다면 위와 동일하게 유지하면 됨.
-/*
-app.get('/images/:imgId', async (req, res) => {
-  const imgId = Number(req.params.imgId);
+// ✅ 좋아요 감소(0 미만 방지)
+app.post('/posts/:id/unlike', authRequired, async (req, res) => {
+  const id = Number(req.params.id);
   const p = ensurePool();
   const conn = await p.getConnection();
   try {
-    const [[img]] = await conn.query(
-      'SELECT img_mime, img_size, img_data, created_at FROM post_images WHERE img_id=?',
-      [imgId]
+    const [r] = await conn.execute(
+      'UPDATE posts SET post_like = IF(post_like>0, post_like-1, 0) WHERE post_id=?',
+      [id]
     );
-    if (!img) return fail(res, 404, 'image not found');
-    const buf = img.img_data;
-    const etag = createHash('sha1').update(buf).digest('hex');
-    res.setHeader('Content-Type', img.img_mime);
-    res.setHeader('Content-Length', String(img.img_size || buf.length));
-    res.setHeader('Cache-Control', 'public, max-age=86400, immutable');
-    res.setHeader('ETag', etag);
-    res.setHeader('Last-Modified', new Date(img.created_at).toUTCString());
-    if (req.headers['if-none-match'] === etag) return res.status(304).end();
-    res.end(buf);
+    if (r.affectedRows === 0) return fail(res, 404, 'not found');
+    ok(res, { unliked: true });
+  } catch (e) {
+    console.error('[POST UNLIKE]', e);
+    fail(res, 500, 'failed');
   } finally {
     conn.release();
   }
 });
-*/
 
 app.put(
   '/posts/:id',
@@ -743,10 +765,9 @@ app.use((err, req, res, _next) => {
 // -------------------- Start --------------------
 app.listen(cfg.httpPort, () => {
   console.log(`[BOOT] listening on :${cfg.httpPort}`);
-  console.log(`[READY] APIs: /health /env-check /__routes /db-ping /init /auth/* /categories /posts /comments`);
+  console.log(`[READY] APIs: /health /env-check /__routes /db-ping /init /auth/* /users/me/settings /categories /posts(/:id/like|/unlike) /comments`);
 });
 
-// -------------------- Process-level guards --------------------
 process.on('unhandledRejection', (reason) => {
   console.error('[UNHANDLED REJECTION]', reason);
 });
