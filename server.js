@@ -1,5 +1,5 @@
 // server.js
-// Node 24 (ESM) — 보안/디버깅 유틸 포함 전체본
+// Node 24 (ESM) — Full API with image streaming, likes, and user settings (UTF-8 safe)
 
 import 'dotenv/config';
 import express from 'express';
@@ -10,7 +10,7 @@ import rateLimit from 'express-rate-limit';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import multer from 'multer';
-import { randomUUID } from 'crypto';
+import { randomUUID, createHash } from 'crypto';
 
 // -------------------- Config --------------------
 const cfg = {
@@ -41,10 +41,15 @@ console.log('[BOOT CONFIG]', {
 const app = express();
 app.set('trust proxy', true);
 
-app.use(helmet());
+app.use(
+  helmet({
+    crossOriginResourcePolicy: { policy: 'cross-origin' },
+  })
+);
 app.use(cors({ origin: cfg.corsOrigin, credentials: false }));
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '2mb' }));
 
+// Request id + basic logging
 app.use((req, res, next) => {
   const rid = randomUUID();
   req.rid = rid;
@@ -56,15 +61,21 @@ app.use((req, res, next) => {
   next();
 });
 
+// Upload (memory) — images stored in DB (LONGBLOB)
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: cfg.maxImageSizeMB * 1024 * 1024, files: cfg.maxImageFiles },
+  fileFilter: (_req, file, cb) => {
+    if (!file.mimetype?.startsWith('image/')) return cb(new Error('Only image uploads are allowed'));
+    cb(null, true);
+  },
 });
 
+// Helpers
 const ok = (res, data = {}) => res.json({ ok: true, ...data });
 const fail = (res, code = 400, message = 'Bad Request') => res.status(code).json({ ok: false, error: message });
 
-// -------------------- DB Pool (lazy) --------------------
+// -------------------- DB Pool --------------------
 let pool = null;
 function ensurePool() {
   if (pool) return pool;
@@ -88,7 +99,7 @@ function ensurePool() {
   return pool;
 }
 
-// -------------------- Diagnostics / Health --------------------
+// -------------------- Diagnostics --------------------
 app.get('/', (_req, res) => ok(res, { route: '/', node: process.version }));
 app.get('/health', (_req, res) => ok(res, { status: 'ok' }));
 app.get('/env-check', (_req, res) =>
@@ -104,7 +115,6 @@ app.get('/env-check', (_req, res) =>
     },
   })
 );
-
 app.get('/__routes', (_req, res) => {
   const routes = [];
   app._router?.stack?.forEach((m) => {
@@ -147,7 +157,7 @@ app.get('/db-ping', async (_req, res) => {
   }
 });
 
-// -------------------- Auth Utils --------------------
+// -------------------- Auth --------------------
 function authRequired(req, res, next) {
   const h = req.headers.authorization || '';
   const token = h.startsWith('Bearer ') ? h.slice(7) : null;
@@ -183,7 +193,7 @@ const authLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-// -------------------- Schema Init (on-demand) --------------------
+// -------------------- Schema Init --------------------
 async function initSchema() {
   const p = ensurePool();
   const conn = await p.getConnection();
@@ -223,7 +233,7 @@ async function initSchema() {
         \`post_cat_id\`   INT UNSIGNED NULL,
         \`post_content\`  TEXT NOT NULL,
         \`post_priority\` INT NOT NULL DEFAULT 0,
-        \`post_like\`     INT UNSIGNED NOT NULL DEFAULT 0,            -- ✅ 좋아요 수
+        \`post_like\`     INT UNSIGNED NOT NULL DEFAULT 0,
         \`created_at\`    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
         \`updated_at\`    DATETIME NULL ON UPDATE CURRENT_TIMESTAMP,
         PRIMARY KEY (\`post_id\`),
@@ -268,29 +278,24 @@ async function initSchema() {
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`
     );
 
-    // ✅ 새로 추가: 사용자 설정 (1:1)
+    // User settings (nickname + notify)
     await conn.query(
-      `CREATE TABLE IF NOT EXISTS \`user_setting\` (
-        \`uset_user_id\`      INT UNSIGNED NOT NULL,
-        \`uset_nickname\`     VARCHAR(50) NULL,
-        \`uset_notify_email\` TINYINT(1) NOT NULL DEFAULT 1,
-        \`uset_notify_push\`  TINYINT(1) NOT NULL DEFAULT 1,
-        \`created_at\`        DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        \`updated_at\`        DATETIME NULL ON UPDATE CURRENT_TIMESTAMP,
-        PRIMARY KEY (\`uset_user_id\`),
-        CONSTRAINT \`fk_user_setting_user\` FOREIGN KEY (\`uset_user_id\`)
-          REFERENCES \`users\`(\`user_id\`) ON DELETE CASCADE ON UPDATE CASCADE
+      `CREATE TABLE IF NOT EXISTS \`user_settings\` (
+        \`us_id\`          INT UNSIGNED NOT NULL AUTO_INCREMENT,
+        \`us_user_id\`     INT UNSIGNED NOT NULL,
+        \`us_nickname\`    VARCHAR(50) NULL,
+        \`us_notify_email\` TINYINT(1) NOT NULL DEFAULT 0,
+        \`us_notify_push\`  TINYINT(1) NOT NULL DEFAULT 0,
+        \`created_at\`     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        \`updated_at\`     DATETIME NULL ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (\`us_id\`),
+        UNIQUE KEY \`uk_user_settings_user\` (\`us_user_id\`),
+        CONSTRAINT \`fk_user_settings_user\` FOREIGN KEY (\`us_user_id\`) REFERENCES \`users\`(\`user_id\`) ON DELETE CASCADE ON UPDATE CASCADE
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`
     );
-
-    // ✅ 기존 DB엔 posts.post_like 없을 수 있어 보강 (중복 에러 무시)
-    try {
-      await conn.query('ALTER TABLE `posts` ADD COLUMN `post_like` INT UNSIGNED NOT NULL DEFAULT 0');
-    } catch (e) {
-      if (e?.code !== 'ER_DUP_FIELDNAME') throw e;
-    }
   } finally {
-    conn.release();
+    // if conn exists, release
+    try { conn.release(); } catch {}
   }
 }
 
@@ -367,53 +372,6 @@ app.post('/auth/login', authLimiter, async (req, res) => {
   } catch (e) {
     console.error('[LOGIN ERROR]', e?.code || e?.message || String(e));
     return res.status(500).json({ ok: false, error: 'LOGIN_INTERNAL' });
-  }
-});
-
-// -------------------- User Setting APIs --------------------
-// 내 설정 조회
-app.get('/users/me/settings', authRequired, async (req, res) => {
-  const uid = Number(req.user.id ?? req.user.uid);
-  const p = ensurePool();
-  const conn = await p.getConnection();
-  try {
-    const [[row]] = await conn.query(
-      'SELECT uset_user_id, uset_nickname, uset_notify_email, uset_notify_push, created_at, updated_at FROM user_setting WHERE uset_user_id=?',
-      [uid]
-    );
-    ok(res, { setting: row || null });
-  } catch (e) {
-    console.error('[USER SETTING GET]', e);
-    fail(res, 500, 'failed');
-  } finally {
-    conn.release();
-  }
-});
-
-// 내 설정 저장(Upsert)
-app.put('/users/me/settings', authRequired, async (req, res) => {
-  const uid = Number(req.user.id ?? req.user.uid);
-  const { nickname, notify_email = 1, notify_push = 1 } = req.body || {};
-  if (nickname && String(nickname).length > 50) return fail(res, 400, 'nickname too long');
-
-  const p = ensurePool();
-  const conn = await p.getConnection();
-  try {
-    await conn.execute(
-      `INSERT INTO user_setting (uset_user_id, uset_nickname, uset_notify_email, uset_notify_push)
-       VALUES (?, ?, ?, ?)
-       ON DUPLICATE KEY UPDATE
-         uset_nickname=VALUES(uset_nickname),
-         uset_notify_email=VALUES(uset_notify_email),
-         uset_notify_push=VALUES(uset_notify_push)`,
-      [uid, nickname ?? null, Number( notify_email ? 1 : 0 ), Number( notify_push ? 1 : 0 )]
-    );
-    ok(res, { saved: true });
-  } catch (e) {
-    console.error('[USER SETTING PUT]', e);
-    fail(res, 500, 'failed');
-  } finally {
-    conn.release();
   }
 });
 
@@ -531,44 +489,67 @@ app.get('/posts/:id', async (req, res) => {
       'SELECT img_id, img_mime, img_size, created_at FROM post_images WHERE img_post_id=? ORDER BY img_id ASC',
       [id]
     );
-    ok(res, { post, images: imgs });
+    const base = `${req.protocol}://${req.get('host')}`;
+    const images = imgs.map((i) => ({
+      ...i,
+      img_url: `${base}/posts/${id}/images/${i.img_id}`,
+    }));
+    ok(res, { post, images });
   } finally {
     conn.release();
   }
 });
 
-// ✅ 좋아요 증가
-app.post('/posts/:id/like', authRequired, async (req, res) => {
+// --- Image streaming routes ---
+app.get('/posts/:id/images/:imgId', async (req, res) => {
   const id = Number(req.params.id);
+  const imgId = Number(req.params.imgId);
   const p = ensurePool();
   const conn = await p.getConnection();
   try {
-    const [r] = await conn.execute('UPDATE posts SET post_like = post_like + 1 WHERE post_id=?', [id]);
-    if (r.affectedRows === 0) return fail(res, 404, 'not found');
-    ok(res, { liked: true });
-  } catch (e) {
-    console.error('[POST LIKE]', e);
-    fail(res, 500, 'failed');
-  } finally {
-    conn.release();
-  }
-});
-
-// ✅ 좋아요 감소(0 미만 방지)
-app.post('/posts/:id/unlike', authRequired, async (req, res) => {
-  const id = Number(req.params.id);
-  const p = ensurePool();
-  const conn = await p.getConnection();
-  try {
-    const [r] = await conn.execute(
-      'UPDATE posts SET post_like = IF(post_like>0, post_like-1, 0) WHERE post_id=?',
-      [id]
+    const [[img]] = await conn.query(
+      'SELECT img_mime, img_size, img_data, created_at FROM post_images WHERE img_post_id=? AND img_id=?',
+      [id, imgId]
     );
-    if (r.affectedRows === 0) return fail(res, 404, 'not found');
-    ok(res, { unliked: true });
-  } catch (e) {
-    console.error('[POST UNLIKE]', e);
-    fail(res, 500, 'failed');
+    if (!img) return fail(res, 404, 'image not found');
+
+    const buf = img.img_data;
+    const etag = createHash('sha1').update(buf).digest('hex');
+    res.setHeader('Content-Type', img.img_mime);
+    res.setHeader('Content-Length', String(img.img_size || buf.length));
+    res.setHeader('Cache-Control', 'public, max-age=86400, immutable');
+    res.setHeader('ETag', etag);
+    res.setHeader('Last-Modified', new Date(img.created_at).toUTCString());
+    if (req.headers['if-none-match'] === etag) return res.status(304).end();
+
+    res.end(buf);
+  } finally {
+    conn.release();
+  }
+});
+
+// Optional: simple image path without post id (handy for debugging)
+app.get('/images/:imgId', async (req, res) => {
+  const imgId = Number(req.params.imgId);
+  const p = ensurePool();
+  const conn = await p.getConnection();
+  try {
+    const [[img]] = await conn.query(
+      'SELECT img_mime, img_size, img_data, created_at FROM post_images WHERE img_id=?',
+      [imgId]
+    );
+    if (!img) return fail(res, 404, 'image not found');
+
+    const buf = img.img_data;
+    const etag = createHash('sha1').update(buf).digest('hex');
+    res.setHeader('Content-Type', img.img_mime);
+    res.setHeader('Content-Length', String(img.img_size || buf.length));
+    res.setHeader('Cache-Control', 'public, max-age=86400, immutable');
+    res.setHeader('ETag', etag);
+    res.setHeader('Last-Modified', new Date(img.created_at).toUTCString());
+    if (req.headers['if-none-match'] === etag) return res.status(304).end();
+
+    res.end(buf);
   } finally {
     conn.release();
   }
@@ -636,120 +617,71 @@ app.delete(
   }
 );
 
-// -------------------- Comments --------------------
-app.post('/posts/:id/comments', authRequired, async (req, res) => {
-  const postId = Number(req.params.id);
-  const { content, parent_cmt_id } = req.body || {};
-  if (!content) return fail(res, 400, 'content required');
-
+// -------------------- Likes --------------------
+// Increment like count
+app.post('/posts/:id/like', authRequired, async (req, res) => {
+  const id = Number(req.params.id);
   const p = ensurePool();
   const conn = await p.getConnection();
   try {
-    let depth = 0, rootId = null;
-    if (parent_cmt_id) {
-      const [[parent]] = await conn.query(
-        'SELECT cmt_id, cmt_thread_root_cmt_id, cmt_depth FROM comments WHERE cmt_id=? AND cmt_post_id=?',
-        [parent_cmt_id, postId]
-      );
-      if (!parent) return fail(res, 400, 'invalid parent');
-      depth = (parent.cmt_depth || 0) + 1;
-      rootId = parent.cmt_thread_root_cmt_id || parent.cmt_id;
-      if (depth > 5) return fail(res, 400, 'max depth reached');
-    }
-    const [r] = await conn.execute(
-      `INSERT INTO comments (cmt_post_id, cmt_user_id, cmt_parent_cmt_id, cmt_thread_root_cmt_id, cmt_depth, cmt_content)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-      [postId, req.user.id ?? req.user.uid ?? null, parent_cmt_id ?? null, rootId, depth, content]
-    );
-    ok(res, { cmt_id: r.insertId });
+    const [r] = await conn.execute('UPDATE posts SET post_like = post_like + 1 WHERE post_id=?', [id]);
+    if (r.affectedRows === 0) return fail(res, 404, 'not found');
+    const [[row]] = await conn.query('SELECT post_like FROM posts WHERE post_id=?', [id]);
+    ok(res, { post_id: id, like: row.post_like });
   } catch (e) {
-    console.error('[COMMENT CREATE]', e);
+    console.error('[LIKE ERROR]', e);
     fail(res, 500, 'failed');
   } finally {
     conn.release();
   }
 });
 
-app.get('/posts/:id/comments', async (req, res) => {
-  const postId = Number(req.params.id);
+app.get('/posts/:id/like', async (req, res) => {
+  const id = Number(req.params.id);
   const p = ensurePool();
   const conn = await p.getConnection();
   try {
-    const [rows] = await conn.query(
-      `SELECT c.cmt_id, c.cmt_parent_cmt_id, c.cmt_thread_root_cmt_id, c.cmt_depth,
-              c.cmt_content, c.created_at, c.updated_at,
-              u.user_id, u.user_name
-         FROM comments c
-         LEFT JOIN users u ON u.user_id=c.cmt_user_id
-        WHERE c.cmt_post_id=?
-        ORDER BY IFNULL(c.cmt_thread_root_cmt_id, c.cmt_id), c.cmt_depth, c.cmt_id`,
-      [postId]
-    );
-    ok(res, { rows });
+    const [[row]] = await conn.query('SELECT post_like FROM posts WHERE post_id=?', [id]);
+    if (!row) return fail(res, 404, 'not found');
+    ok(res, { post_id: id, like: row.post_like });
   } finally {
     conn.release();
   }
 });
 
-app.put(
-  '/comments/:cmt_id',
-  authRequired,
-  adminOrOwner(async (req) => {
-    const p = ensurePool();
-    const conn = await p.getConnection();
-    try {
-      const [[row]] = await conn.query('SELECT cmt_user_id FROM comments WHERE cmt_id=?', [req.params.cmt_id]);
-      return row?.cmt_user_id;
-    } finally {
-      conn.release();
-    }
-  }),
-  async (req, res) => {
-    const id = Number(req.params.cmt_id);
-    const { content } = req.body || {};
-    if (!content) return fail(res, 400, 'content required');
-    const p = ensurePool();
-    const conn = await p.getConnection();
-    try {
-      const [r] = await conn.execute('UPDATE comments SET cmt_content=? WHERE cmt_id=?', [content, id]);
-      ok(res, { affected: r.affectedRows });
-    } catch (e) {
-      console.error('[COMMENT UPDATE]', e);
-      fail(res, 500, 'failed');
-    } finally {
-      conn.release();
-    }
+// -------------------- User Settings --------------------
+app.get('/users/me/settings', authRequired, async (req, res) => {
+  const p = ensurePool();
+  const conn = await p.getConnection();
+  try {
+    const uid = req.user.id ?? req.user.uid;
+    const [[s]] = await conn.query('SELECT us_nickname, us_notify_email, us_notify_push FROM user_settings WHERE us_user_id=?', [uid]);
+    ok(res, { settings: s || null });
+  } finally {
+    conn.release();
   }
-);
+});
 
-app.delete(
-  '/comments/:cmt_id',
-  authRequired,
-  adminOrOwner(async (req) => {
-    const p = ensurePool();
-    const conn = await p.getConnection();
-    try {
-      const [[row]] = await conn.query('SELECT cmt_user_id FROM comments WHERE cmt_id=?', [req.params.cmt_id]);
-      return row?.cmt_user_id;
-    } finally {
-      conn.release();
-    }
-  }),
-  async (req, res) => {
-    const id = Number(req.params.cmt_id);
-    const p = ensurePool();
-    const conn = await p.getConnection();
-    try {
-      const [r] = await conn.execute('DELETE FROM comments WHERE cmt_id=?', [id]);
-      ok(res, { deleted: r.affectedRows });
-    } catch (e) {
-      console.error('[COMMENT DELETE]', e);
-      fail(res, 500, 'failed');
-    } finally {
-      conn.release();
-    }
+app.put('/users/me/settings', authRequired, async (req, res) => {
+  const { nickname, notify_email, notify_push } = req.body || {};
+  const p = ensurePool();
+  const conn = await p.getConnection();
+  try {
+    const uid = req.user.id ?? req.user.uid;
+    await conn.execute(
+      `INSERT INTO user_settings (us_user_id, us_nickname, us_notify_email, us_notify_push)
+       VALUES (?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE us_nickname=VALUES(us_nickname), us_notify_email=VALUES(us_notify_email), us_notify_push=VALUES(us_notify_push)`,
+      [uid, nickname ?? null, notify_email ? 1 : 0, notify_push ? 1 : 0]
+    );
+    ok(res, { updated: true });
+  } catch (e) {
+    console.error('[USER SETTINGS]', e);
+    fail(res, 500, 'failed');
+  } finally {
+    conn.release();
   }
-);
+});
 
 // -------------------- 404 & Error Handlers --------------------
 app.use((req, res, _next) => {
@@ -765,7 +697,7 @@ app.use((err, req, res, _next) => {
 // -------------------- Start --------------------
 app.listen(cfg.httpPort, () => {
   console.log(`[BOOT] listening on :${cfg.httpPort}`);
-  console.log(`[READY] APIs: /health /env-check /__routes /db-ping /init /auth/* /users/me/settings /categories /posts(/:id/like|/unlike) /comments`);
+  console.log(`[READY] APIs: /health /env-check /__routes /db-ping /init /auth/* /categories /posts /comments /images /likes /users/me/settings`);
 });
 
 process.on('unhandledRejection', (reason) => {
