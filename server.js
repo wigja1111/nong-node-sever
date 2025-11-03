@@ -617,37 +617,7 @@ app.delete(
   }
 );
 
-// -------------------- Likes --------------------
-// Increment like count
-app.post('/posts/:id/like', authRequired, async (req, res) => {
-  const id = Number(req.params.id);
-  const p = ensurePool();
-  const conn = await p.getConnection();
-  try {
-    const [r] = await conn.execute('UPDATE posts SET post_like = post_like + 1 WHERE post_id=?', [id]);
-    if (r.affectedRows === 0) return fail(res, 404, 'not found');
-    const [[row]] = await conn.query('SELECT post_like FROM posts WHERE post_id=?', [id]);
-    ok(res, { post_id: id, like: row.post_like });
-  } catch (e) {
-    console.error('[LIKE ERROR]', e);
-    fail(res, 500, 'failed');
-  } finally {
-    conn.release();
-  }
-});
 
-app.get('/posts/:id/like', async (req, res) => {
-  const id = Number(req.params.id);
-  const p = ensurePool();
-  const conn = await p.getConnection();
-  try {
-    const [[row]] = await conn.query('SELECT post_like FROM posts WHERE post_id=?', [id]);
-    if (!row) return fail(res, 404, 'not found');
-    ok(res, { post_id: id, like: row.post_like });
-  } finally {
-    conn.release();
-  }
-});
 
 // -------------------- User Settings --------------------
 app.get('/users/me/settings', authRequired, async (req, res) => {
@@ -682,6 +652,106 @@ app.put('/users/me/settings', authRequired, async (req, res) => {
     conn.release();
   }
 });
+
+// --- PATCH: Comments & Like Toggle ---
+// Insert near other routes.
+
+// List comments for a post
+app.get('/posts/:id/comments', async (req, res) => {
+  const postId = Number(req.params.id);
+  const p = ensurePool();
+  const conn = await p.getConnection();
+  try {
+    const [rows] = await conn.query(
+      `SELECT c.cmt_id, c.cmt_post_id, c.cmt_user_id, c.cmt_parent_cmt_id,
+              c.cmt_thread_root_cmt_id, c.cmt_depth, c.cmt_content, c.created_at,
+              u.user_name
+         FROM comments c
+    LEFT JOIN users u ON u.user_id=c.cmt_user_id
+        WHERE c.cmt_post_id=?
+        ORDER BY c.created_at ASC`,
+      [postId]
+    );
+    ok(res, { rows });
+  } catch (e) {
+    console.error('[COMMENTS LIST]', e);
+    fail(res, 500, 'List comments failed');
+  } finally { conn.release(); }
+});
+
+// Create comment (root or reply)
+app.post('/posts/:id/comments', authRequired, async (req, res) => {
+  const postId = Number(req.params.id);
+  const userId = Number(req.user.id ?? req.user.uid);
+  const content = (req.body?.content || '').toString().trim();
+  const parentId = req.body?.parent_id ? Number(req.body.parent_id) : null;
+  if (!content) return fail(res, 400, 'content required');
+
+  const p = ensurePool();
+  const conn = await p.getConnection();
+  try {
+    let depth = 0, rootId = null;
+    if (parentId) {
+      const [[parent]] = await conn.query('SELECT cmt_id, cmt_depth, cmt_thread_root_cmt_id FROM comments WHERE cmt_id=?', [parentId]);
+      if (!parent) return fail(res, 404, 'parent not found');
+      depth = Math.min(4, Number(parent.cmt_depth || 0) + 1);
+      rootId = parent.cmt_thread_root_cmt_id ?? parent.cmt_id;
+    }
+    const [r] = await conn.execute(
+      `INSERT INTO comments (cmt_post_id, cmt_user_id, cmt_parent_cmt_id, cmt_thread_root_cmt_id, cmt_depth, cmt_content)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [postId, userId, parentId ?? null, rootId, depth, content]
+    );
+    ok(res, { comment_id: r.insertId });
+  } catch (e) {
+    console.error('[COMMENT CREATE]', e);
+    fail(res, 500, 'create failed');
+  } finally { conn.release(); }
+});
+
+// --- Like toggle per user ---
+// per-user like table
+(async()=>{
+  const p = ensurePool(); const conn = await p.getConnection();
+  try {
+    await conn.query(`CREATE TABLE IF NOT EXISTS post_likes (
+      pl_post_id INT UNSIGNED NOT NULL,
+      pl_user_id INT UNSIGNED NOT NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (pl_post_id, pl_user_id),
+      CONSTRAINT fk_pl_post FOREIGN KEY (pl_post_id) REFERENCES posts(post_id) ON DELETE CASCADE ON UPDATE CASCADE,
+      CONSTRAINT fk_pl_user FOREIGN KEY (pl_user_id) REFERENCES users(user_id) ON DELETE CASCADE ON UPDATE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+  } finally { conn.release(); }
+})();
+
+app.post('/posts/:id/like', authRequired, async (req, res) => {
+  const postId = Number(req.params.id);
+  const userId = Number(req.user.id ?? req.user.uid);
+  const p = ensurePool(); const conn = await p.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [[existing]] = await conn.query('SELECT 1 FROM post_likes WHERE pl_post_id=? AND pl_user_id=?', [postId, userId]);
+    let liked;
+    if (existing) {
+      await conn.execute('DELETE FROM post_likes WHERE pl_post_id=? AND pl_user_id=?', [postId, userId]);
+      await conn.execute('UPDATE posts SET post_like = GREATEST(0, post_like - 1) WHERE post_id=?', [postId]);
+      liked = false;
+    } else {
+      await conn.execute('INSERT INTO post_likes (pl_post_id, pl_user_id) VALUES (?, ?)', [postId, userId]);
+      await conn.execute('UPDATE posts SET post_like = post_like + 1 WHERE post_id=?', [postId]);
+      liked = true;
+    }
+    const [[row]] = await conn.query('SELECT post_like FROM posts WHERE post_id=?', [postId]);
+    await conn.commit();
+    ok(res, { post_id: postId, liked, like: row.post_like });
+  } catch (e) {
+    await conn.rollback();
+    console.error('[LIKE TOGGLE]', e);
+    fail(res, 500, 'toggle failed');
+  } finally { conn.release(); }
+});
+
 
 // -------------------- 404 & Error Handlers --------------------
 app.use((req, res, _next) => {
