@@ -1,5 +1,7 @@
+
 // server.js
-// Node 24 (ESM) — Full API with image streaming, likes, and user settings (UTF-8 safe)
+// Node 24 (ESM) — Full API with image streaming, likes, user settings, avatar, comment edit/delete,
+// post edit/delete (_method override), me-filter, and lightweight push notifications (DB + optional webhook).
 
 import 'dotenv/config';
 import express from 'express';
@@ -25,6 +27,7 @@ const cfg = {
   maxImageSizeMB: Number(process.env.MAX_IMAGE_MB || 10),
   maxImageFiles: Number(process.env.MAX_IMAGE_FILES || 10),
   jwtSecret: process.env.JWT_SECRET || 'dev-secret-change-it',
+  pushWebhook: process.env.PUSH_WEBHOOK || '',   // optional: external push webhook
 };
 
 console.log('[BOOT CONFIG]', {
@@ -35,6 +38,7 @@ console.log('[BOOT CONFIG]', {
   PORT: cfg.httpPort,
   CORS_ORIGIN: cfg.corsOrigin,
   JWT_SECRET_SET: cfg.jwtSecret !== 'dev-secret-change-it',
+  PUSH_WEBHOOK_SET: !!cfg.pushWebhook,
 });
 
 // -------------------- App --------------------
@@ -112,6 +116,7 @@ app.get('/env-check', (_req, res) =>
       DB_NAME: !!cfg.dbName,
       JWT_SECRET: cfg.jwtSecret !== 'dev-secret-change-it',
       CORS_ORIGIN: cfg.corsOrigin,
+      PUSH_WEBHOOK: !!cfg.pushWebhook,
     },
   })
 );
@@ -278,7 +283,7 @@ async function initSchema() {
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`
     );
 
-    // User settings (nickname + notify)
+    // User settings
     await conn.query(
       `CREATE TABLE IF NOT EXISTS \`user_settings\` (
         \`us_id\`          INT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -293,8 +298,51 @@ async function initSchema() {
         CONSTRAINT \`fk_user_settings_user\` FOREIGN KEY (\`us_user_id\`) REFERENCES \`users\`(\`user_id\`) ON DELETE CASCADE ON UPDATE CASCADE
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`
     );
+
+    // Per-user like table
+    await conn.query(`CREATE TABLE IF NOT EXISTS post_likes (
+      pl_post_id INT UNSIGNED NOT NULL,
+      pl_user_id INT UNSIGNED NOT NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (pl_post_id, pl_user_id),
+      CONSTRAINT fk_pl_post FOREIGN KEY (pl_post_id) REFERENCES posts(post_id) ON DELETE CASCADE ON UPDATE CASCADE,
+      CONSTRAINT fk_pl_user FOREIGN KEY (pl_user_id) REFERENCES users(user_id) ON DELETE CASCADE ON UPDATE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+
+    // Avatar table
+    await conn.query(`CREATE TABLE IF NOT EXISTS user_avatars (
+      ua_user_id INT UNSIGNED NOT NULL PRIMARY KEY,
+      ua_mime VARCHAR(80) NOT NULL,
+      ua_size INT UNSIGNED NOT NULL,
+      ua_data LONGBLOB NOT NULL,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      CONSTRAINT fk_ua_user FOREIGN KEY (ua_user_id) REFERENCES users(user_id) ON DELETE CASCADE ON UPDATE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+
+    // Push: device tokens + notifications log
+    await conn.query(`CREATE TABLE IF NOT EXISTS device_tokens (
+      dt_user_id INT UNSIGNED NOT NULL,
+      dt_token VARCHAR(512) NOT NULL,
+      dt_platform VARCHAR(20) NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (dt_user_id, dt_token),
+      CONSTRAINT fk_dt_user FOREIGN KEY (dt_user_id) REFERENCES users(user_id) ON DELETE CASCADE ON UPDATE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+
+    await conn.query(`CREATE TABLE IF NOT EXISTS notifications (
+      noti_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      noti_user_id INT UNSIGNED NOT NULL,
+      noti_type ENUM('comment','like') NOT NULL,
+      noti_post_id INT UNSIGNED NOT NULL,
+      noti_from_user_id INT UNSIGNED NULL,
+      payload JSON NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (noti_id),
+      KEY idx_noti_user (noti_user_id),
+      CONSTRAINT fk_noti_user FOREIGN KEY (noti_user_id) REFERENCES users(user_id) ON DELETE CASCADE ON UPDATE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+
   } finally {
-    // if conn exists, release
     try { conn.release(); } catch {}
   }
 }
@@ -439,23 +487,35 @@ app.post('/posts', authRequired, upload.array('images', cfg.maxImageFiles), asyn
   }
 });
 
+// List posts (supports me=1 if authed)
 app.get('/posts', async (req, res) => {
-  const { cat_id, page = 1, size = 10 } = req.query;
+  const { cat_id, page = 1, size = 10, me } = req.query;
   const limit = Math.max(1, Math.min(Number(size) || 10, 50));
   const offset = (Math.max(1, Number(page) || 1) - 1) * limit;
+
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  let authed = null;
+  if (token) {
+    try { authed = jwt.verify(token, cfg.jwtSecret); } catch {}
+  }
 
   const p = ensurePool();
   const conn = await p.getConnection();
   try {
     const params = [];
     let where = ' WHERE 1=1 ';
-    if (cat_id) { where += ' AND post_cat_id=? '; params.push(Number(cat_id)); }
+    if (cat_id) { where += ' AND p.post_cat_id=? '; params.push(Number(cat_id)); }
+    if (me && authed?.id) { where += ' AND p.post_user_id=? '; params.push(Number(authed.id)); }
+
     const sql = `
       SELECT p.post_id, p.post_content, p.post_priority, p.post_like, p.created_at, p.updated_at,
-             u.user_id, u.user_name, c.cat_id, c.cat_name
+             u.user_id, u.user_name, c.cat_id, c.cat_name,
+             IF(pl.pl_user_id IS NULL, 0, 1) AS liked
         FROM posts p
         LEFT JOIN users u ON u.user_id = p.post_user_id
         LEFT JOIN categories c ON c.cat_id = p.post_cat_id
+        LEFT JOIN post_likes pl ON pl.pl_post_id=p.post_id AND pl.pl_user_id=${authed?.id ? Number(authed.id) : 0}
        ${where}
        ORDER BY p.post_priority DESC, p.created_at DESC
        LIMIT ? OFFSET ?`;
@@ -470,16 +530,27 @@ app.get('/posts', async (req, res) => {
   }
 });
 
+// Post detail (+ liked flag + images URLs)
 app.get('/posts/:id', async (req, res) => {
   const id = Number(req.params.id);
+
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  let authed = null;
+  if (token) {
+    try { authed = jwt.verify(token, cfg.jwtSecret); } catch {}
+  }
+
   const p = ensurePool();
   const conn = await p.getConnection();
   try {
     const [[post]] = await conn.query(
-      `SELECT p.*, u.user_name, c.cat_name
+      `SELECT p.*, u.user_name, c.cat_name,
+              IF(pl.pl_user_id IS NULL, 0, 1) AS liked
          FROM posts p
          LEFT JOIN users u ON u.user_id=p.post_user_id
          LEFT JOIN categories c ON c.cat_id=p.post_cat_id
+         LEFT JOIN post_likes pl ON pl.pl_post_id=p.post_id AND pl.pl_user_id=${authed?.id ? Number(authed.id) : 0}
         WHERE p.post_id=?`,
       [id]
     );
@@ -528,7 +599,6 @@ app.get('/posts/:id/images/:imgId', async (req, res) => {
   }
 });
 
-// Optional: simple image path without post id (handy for debugging)
 app.get('/images/:imgId', async (req, res) => {
   const imgId = Number(req.params.imgId);
   const p = ensurePool();
@@ -555,6 +625,7 @@ app.get('/images/:imgId', async (req, res) => {
   }
 });
 
+// ----- Post Update/Delete -----
 app.put(
   '/posts/:id',
   authRequired,
@@ -588,6 +659,12 @@ app.put(
   }
 );
 
+// Method override by body: POST + _method=PUT
+app.post('/posts/:id', authRequired, async (req, res, next) => {
+  if ((req.body?._method || '').toString().toUpperCase() === 'PUT') return app._router.handle({ ...req, method: 'PUT' }, res, next);
+  return fail(res, 400, 'Unsupported method');
+});
+
 app.delete(
   '/posts/:id',
   authRequired,
@@ -617,7 +694,280 @@ app.delete(
   }
 );
 
+// Method override for delete: POST + _method=DELETE
+app.post('/posts/:id/delete', authRequired, async (req, res, next) => {
+  req.body = req.body || {};
+  req.body._method = 'DELETE';
+  return app._router.handle({ ...req, method: 'DELETE' }, res, next);
+});
 
+// -------------------- Comments --------------------
+// List comments for a post
+app.get('/posts/:id/comments', async (req, res) => {
+  const postId = Number(req.params.id);
+  const p = ensurePool();
+  const conn = await p.getConnection();
+  try {
+    const [rows] = await conn.query(
+      `SELECT c.cmt_id, c.cmt_post_id, c.cmt_user_id, c.cmt_parent_cmt_id,
+              c.cmt_thread_root_cmt_id, c.cmt_depth, c.cmt_content, c.created_at, c.updated_at,
+              u.user_name
+         FROM comments c
+    LEFT JOIN users u ON u.user_id=c.cmt_user_id
+        WHERE c.cmt_post_id=?
+        ORDER BY c.created_at ASC`,
+      [postId]
+    );
+    ok(res, { rows });
+  } catch (e) {
+    console.error('[COMMENTS LIST]', e);
+    fail(res, 500, 'List comments failed');
+  } finally { conn.release(); }
+});
+
+// Create comment (root or reply) + create notifications
+app.post('/posts/:id/comments', authRequired, async (req, res) => {
+  const postId = Number(req.params.id);
+  const userId = Number(req.user.id ?? req.user.uid);
+  const content = (req.body?.content || '').toString().trim();
+  const parentId = req.body?.parent_id ? Number(req.body.parent_id) : null;
+  if (!content) return fail(res, 400, 'content required');
+
+  const p = ensurePool();
+  const conn = await p.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    let depth = 0, rootId = null;
+    if (parentId) {
+      const [[parent]] = await conn.query('SELECT cmt_id, cmt_depth, cmt_thread_root_cmt_id FROM comments WHERE cmt_id=?', [parentId]);
+      if (!parent) { await conn.rollback(); return fail(res, 404, 'parent not found'); }
+      depth = Math.min(4, Number(parent.cmt_depth || 0) + 1);
+      rootId = parent.cmt_thread_root_cmt_id ?? parent.cmt_id;
+    }
+    const [r] = await conn.execute(
+      `INSERT INTO comments (cmt_post_id, cmt_user_id, cmt_parent_cmt_id, cmt_thread_root_cmt_id, cmt_depth, cmt_content)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [postId, userId, parentId ?? null, rootId, depth, content]
+    );
+
+    // Notification target: post author
+    const [[post]] = await conn.query('SELECT post_user_id FROM posts WHERE post_id=?', [postId]);
+    const targetUser = post?.post_user_id;
+    if (targetUser && Number(targetUser) !== userId) {
+      await conn.execute(
+        `INSERT INTO notifications (noti_user_id, noti_type, noti_post_id, noti_from_user_id, payload)
+         VALUES (?, 'comment', ?, ?, JSON_OBJECT('comment_id', ?, 'content', ?))`,
+        [targetUser, postId, userId, r.insertId, content]
+      );
+    }
+
+    await conn.commit();
+
+    // Optional webhook push
+    if (cfg.pushWebhook && targetUser && Number(targetUser) !== userId) {
+      try {
+        const resp = await fetch(cfg.pushWebhook, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ type: 'comment', post_id: postId, to_user_id: targetUser, from_user_id: userId, comment_id: r.insertId, content }),
+        });
+        console.log('[PUSH WEBHOOK comment]', resp.status);
+      } catch(e) { console.warn('[PUSH WEBHOOK FAIL]', e.message); }
+    }
+
+    ok(res, { comment_id: r.insertId });
+  } catch (e) {
+    try { await conn.rollback(); } catch {}
+    console.error('[COMMENT CREATE]', e);
+    fail(res, 500, 'create failed');
+  } finally { conn.release(); }
+});
+
+// Update comment
+app.put('/comments/:id', authRequired, adminOrOwner(async (req) => {
+  const p = ensurePool(); const conn = await p.getConnection();
+  try {
+    const [[row]] = await conn.query('SELECT cmt_user_id FROM comments WHERE cmt_id=?', [req.params.id]);
+    return row?.cmt_user_id;
+  } finally { conn.release(); }
+}), async (req, res) => {
+  const id = Number(req.params.id);
+  const content = (req.body?.content || '').toString().trim();
+  if (!content) return fail(res, 400, 'content required');
+  const p = ensurePool(); const conn = await p.getConnection();
+  try {
+    const [r] = await conn.execute('UPDATE comments SET cmt_content=? WHERE cmt_id=?', [content, id]);
+    ok(res, { affected: r.affectedRows });
+  } catch (e) {
+    console.error('[COMMENT UPDATE]', e);
+    fail(res, 500, 'update failed');
+  } finally { conn.release(); }
+});
+
+// Override: POST + _method=PUT
+app.post('/comments/:id', authRequired, async (req, res, next) => {
+  if ((req.body?._method || '').toString().toUpperCase() === 'PUT') return app._router.handle({ ...req, method: 'PUT' }, res, next);
+  return fail(res, 400, 'Unsupported method');
+});
+
+// Delete comment
+app.delete('/comments/:id', authRequired, adminOrOwner(async (req) => {
+  const p = ensurePool(); const conn = await p.getConnection();
+  try {
+    const [[row]] = await conn.query('SELECT cmt_user_id FROM comments WHERE cmt_id=?', [req.params.id]);
+    return row?.cmt_user_id;
+  } finally { conn.release(); }
+}), async (req, res) => {
+  const id = Number(req.params.id);
+  const p = ensurePool(); const conn = await p.getConnection();
+  try {
+    const [r] = await conn.execute('DELETE FROM comments WHERE cmt_id=?', [id]);
+    ok(res, { deleted: r.affectedRows });
+  } catch (e) {
+    console.error('[COMMENT DELETE]', e);
+    fail(res, 500, 'delete failed');
+  } finally { conn.release(); }
+});
+
+// Override delete: POST + _method=DELETE
+app.post('/comments/:id/delete', authRequired, async (req, res, next) => {
+  req.body = req.body || {};
+  req.body._method = 'DELETE';
+  return app._router.handle({ ...req, method: 'DELETE' }, res, next);
+});
+
+// --- Like toggle per user + like notifications ---
+app.post('/posts/:id/like', authRequired, async (req, res) => {
+  const postId = Number(req.params.id);
+  const userId = Number(req.user.id ?? req.user.uid);
+  const p = ensurePool(); const conn = await p.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [[existing]] = await conn.query('SELECT 1 FROM post_likes WHERE pl_post_id=? AND pl_user_id=?', [postId, userId]);
+    let liked;
+    if (existing) {
+      await conn.execute('DELETE FROM post_likes WHERE pl_post_id=? AND pl_user_id=?', [postId, userId]);
+      await conn.execute('UPDATE posts SET post_like = GREATEST(0, post_like - 1) WHERE post_id=?', [postId]);
+      liked = false;
+    } else {
+      await conn.execute('INSERT INTO post_likes (pl_post_id, pl_user_id) VALUES (?, ?)', [postId, userId]);
+      await conn.execute('UPDATE posts SET post_like = post_like + 1 WHERE post_id=?', [postId]);
+      liked = true;
+
+      // Notify post author on new like
+      const [[post]] = await conn.query('SELECT post_user_id FROM posts WHERE post_id=?', [postId]);
+      const targetUser = post?.post_user_id;
+      if (targetUser && Number(targetUser) !== userId) {
+        await conn.execute(
+          `INSERT INTO notifications (noti_user_id, noti_type, noti_post_id, noti_from_user_id, payload)
+           VALUES (?, 'like', ?, ?, NULL)`,
+          [targetUser, postId, userId]
+        );
+      }
+    }
+    const [[row]] = await conn.query('SELECT post_like FROM posts WHERE post_id=?', [postId]);
+    await conn.commit();
+
+    // Webhook (only when new like)
+    if (cfg.pushWebhook && liked) {
+      try {
+        const resp = await fetch(cfg.pushWebhook, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ type: 'like', post_id: postId, from_user_id: userId }),
+        });
+        console.log('[PUSH WEBHOOK like]', resp.status);
+      } catch(e) { console.warn('[PUSH WEBHOOK FAIL]', e.message); }
+    }
+
+    ok(res, { post_id: postId, liked, like: row.post_like });
+  } catch (e) {
+    try { await conn.rollback(); } catch {}
+    console.error('[LIKE TOGGLE]', e);
+    fail(res, 500, 'toggle failed');
+  } finally { conn.release(); }
+});
+
+// -------------------- Avatar (Profile image) --------------------
+// Upload or update my avatar
+app.post('/me/avatar', authRequired, upload.single('file'), async (req, res) => {
+  const f = req.file;
+  if (!f) return fail(res, 400, 'file required');
+  if (!f.mimetype?.startsWith('image/')) return fail(res, 400, 'image only');
+  const uid = Number(req.user.id ?? req.user.uid);
+
+  const p = ensurePool(); const conn = await p.getConnection();
+  try {
+    await conn.execute(
+      `INSERT INTO user_avatars (ua_user_id, ua_mime, ua_size, ua_data)
+       VALUES (?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE ua_mime=VALUES(ua_mime), ua_size=VALUES(ua_size), ua_data=VALUES(ua_data)`,
+      [uid, f.mimetype, f.size, f.buffer]
+    );
+    ok(res, { updated: true });
+  } catch (e) {
+    console.error('[AVATAR UPSERT]', e);
+    fail(res, 500, 'avatar failed');
+  } finally { conn.release(); }
+});
+
+// Stream avatar
+app.get('/users/:id/avatar', async (req, res) => {
+  const uid = Number(req.params.id);
+  const p = ensurePool(); const conn = await p.getConnection();
+  try {
+    const [[row]] = await conn.query('SELECT ua_mime, ua_size, ua_data, updated_at FROM user_avatars WHERE ua_user_id=?', [uid]);
+    if (!row) return fail(res, 404, 'avatar not found');
+    const buf = row.ua_data;
+    const etag = createHash('sha1').update(buf).digest('hex');
+    res.setHeader('Content-Type', row.ua_mime);
+    res.setHeader('Content-Length', String(row.ua_size || buf.length));
+    res.setHeader('Cache-Control', 'public, max-age=86400, immutable');
+    res.setHeader('ETag', etag);
+    res.setHeader('Last-Modified', new Date(row.updated_at).toUTCString());
+    if (req.headers['if-none-match'] === etag) return res.status(304).end();
+    res.end(buf);
+  } finally { conn.release(); }
+});
+
+// -------------------- Push registration & fetch --------------------
+app.post('/push/register', authRequired, async (req, res) => {
+  const { token, platform } = req.body || {};
+  if (!token) return fail(res, 400, 'token required');
+  const uid = Number(req.user.id ?? req.user.uid);
+  const p = ensurePool(); const conn = await p.getConnection();
+  try {
+    await conn.execute(
+      `INSERT INTO device_tokens (dt_user_id, dt_token, dt_platform) VALUES (?, ?, ?)
+       ON DUPLICATE KEY UPDATE dt_platform=VALUES(dt_platform)`,
+      [uid, token, platform || null]
+    );
+    ok(res, { registered: true });
+  } catch (e) {
+    console.error('[PUSH REGISTER]', e);
+    fail(res, 500, 'register failed');
+  } finally { conn.release(); }
+});
+
+app.get('/notifications', authRequired, async (req, res) => {
+  const uid = Number(req.user.id ?? req.user.uid);
+  const p = ensurePool(); const conn = await p.getConnection();
+  try {
+    const [rows] = await conn.query(
+      `SELECT noti_id, noti_type, noti_post_id, noti_from_user_id, payload, created_at
+         FROM notifications
+        WHERE noti_user_id=?
+        ORDER BY noti_id DESC
+        LIMIT 100`,
+      [uid]
+    );
+    ok(res, { rows });
+  } catch (e) {
+    console.error('[NOTI LIST]', e);
+    fail(res, 500, 'failed');
+  } finally { conn.release(); }
+});
 
 // -------------------- User Settings --------------------
 app.get('/users/me/settings', authRequired, async (req, res) => {
@@ -653,106 +1003,6 @@ app.put('/users/me/settings', authRequired, async (req, res) => {
   }
 });
 
-// --- PATCH: Comments & Like Toggle ---
-// Insert near other routes.
-
-// List comments for a post
-app.get('/posts/:id/comments', async (req, res) => {
-  const postId = Number(req.params.id);
-  const p = ensurePool();
-  const conn = await p.getConnection();
-  try {
-    const [rows] = await conn.query(
-      `SELECT c.cmt_id, c.cmt_post_id, c.cmt_user_id, c.cmt_parent_cmt_id,
-              c.cmt_thread_root_cmt_id, c.cmt_depth, c.cmt_content, c.created_at,
-              u.user_name
-         FROM comments c
-    LEFT JOIN users u ON u.user_id=c.cmt_user_id
-        WHERE c.cmt_post_id=?
-        ORDER BY c.created_at ASC`,
-      [postId]
-    );
-    ok(res, { rows });
-  } catch (e) {
-    console.error('[COMMENTS LIST]', e);
-    fail(res, 500, 'List comments failed');
-  } finally { conn.release(); }
-});
-
-// Create comment (root or reply)
-app.post('/posts/:id/comments', authRequired, async (req, res) => {
-  const postId = Number(req.params.id);
-  const userId = Number(req.user.id ?? req.user.uid);
-  const content = (req.body?.content || '').toString().trim();
-  const parentId = req.body?.parent_id ? Number(req.body.parent_id) : null;
-  if (!content) return fail(res, 400, 'content required');
-
-  const p = ensurePool();
-  const conn = await p.getConnection();
-  try {
-    let depth = 0, rootId = null;
-    if (parentId) {
-      const [[parent]] = await conn.query('SELECT cmt_id, cmt_depth, cmt_thread_root_cmt_id FROM comments WHERE cmt_id=?', [parentId]);
-      if (!parent) return fail(res, 404, 'parent not found');
-      depth = Math.min(4, Number(parent.cmt_depth || 0) + 1);
-      rootId = parent.cmt_thread_root_cmt_id ?? parent.cmt_id;
-    }
-    const [r] = await conn.execute(
-      `INSERT INTO comments (cmt_post_id, cmt_user_id, cmt_parent_cmt_id, cmt_thread_root_cmt_id, cmt_depth, cmt_content)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-      [postId, userId, parentId ?? null, rootId, depth, content]
-    );
-    ok(res, { comment_id: r.insertId });
-  } catch (e) {
-    console.error('[COMMENT CREATE]', e);
-    fail(res, 500, 'create failed');
-  } finally { conn.release(); }
-});
-
-// --- Like toggle per user ---
-// per-user like table
-(async()=>{
-  const p = ensurePool(); const conn = await p.getConnection();
-  try {
-    await conn.query(`CREATE TABLE IF NOT EXISTS post_likes (
-      pl_post_id INT UNSIGNED NOT NULL,
-      pl_user_id INT UNSIGNED NOT NULL,
-      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      PRIMARY KEY (pl_post_id, pl_user_id),
-      CONSTRAINT fk_pl_post FOREIGN KEY (pl_post_id) REFERENCES posts(post_id) ON DELETE CASCADE ON UPDATE CASCADE,
-      CONSTRAINT fk_pl_user FOREIGN KEY (pl_user_id) REFERENCES users(user_id) ON DELETE CASCADE ON UPDATE CASCADE
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
-  } finally { conn.release(); }
-})();
-
-app.post('/posts/:id/like', authRequired, async (req, res) => {
-  const postId = Number(req.params.id);
-  const userId = Number(req.user.id ?? req.user.uid);
-  const p = ensurePool(); const conn = await p.getConnection();
-  try {
-    await conn.beginTransaction();
-    const [[existing]] = await conn.query('SELECT 1 FROM post_likes WHERE pl_post_id=? AND pl_user_id=?', [postId, userId]);
-    let liked;
-    if (existing) {
-      await conn.execute('DELETE FROM post_likes WHERE pl_post_id=? AND pl_user_id=?', [postId, userId]);
-      await conn.execute('UPDATE posts SET post_like = GREATEST(0, post_like - 1) WHERE post_id=?', [postId]);
-      liked = false;
-    } else {
-      await conn.execute('INSERT INTO post_likes (pl_post_id, pl_user_id) VALUES (?, ?)', [postId, userId]);
-      await conn.execute('UPDATE posts SET post_like = post_like + 1 WHERE post_id=?', [postId]);
-      liked = true;
-    }
-    const [[row]] = await conn.query('SELECT post_like FROM posts WHERE post_id=?', [postId]);
-    await conn.commit();
-    ok(res, { post_id: postId, liked, like: row.post_like });
-  } catch (e) {
-    await conn.rollback();
-    console.error('[LIKE TOGGLE]', e);
-    fail(res, 500, 'toggle failed');
-  } finally { conn.release(); }
-});
-
-
 // -------------------- 404 & Error Handlers --------------------
 app.use((req, res, _next) => {
   console.warn('[404]', req.method, req.url);
@@ -767,7 +1017,7 @@ app.use((err, req, res, _next) => {
 // -------------------- Start --------------------
 app.listen(cfg.httpPort, () => {
   console.log(`[BOOT] listening on :${cfg.httpPort}`);
-  console.log(`[READY] APIs: /health /env-check /__routes /db-ping /init /auth/* /categories /posts /comments /images /likes /users/me/settings`);
+  console.log(`[READY] APIs: /health /env-check /__routes /db-ping /init /auth/* /categories /posts /comments /images /likes /users/me/settings /me/avatar /users/:id/avatar /push/* /notifications`);
 });
 
 process.on('unhandledRejection', (reason) => {
