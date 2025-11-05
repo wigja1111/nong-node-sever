@@ -775,58 +775,109 @@ app.post('/posts/:id/comments', authRequired, async (req, res) => {
   const userId = Number(req.user.id ?? req.user.uid);
   const content = (req.body?.content || '').toString().trim();
   const parentId = req.body?.parent_id ? Number(req.body.parent_id) : null;
-  if (!content) return fail(res, 400, 'content required');
+
+  if (!postId || !Number.isFinite(postId)) {
+    return fail(res, 400, 'invalid post id');
+  }
+  if (!userId || !Number.isFinite(userId)) {
+    return fail(res, 401, 'invalid user');
+  }
+  if (!content) {
+    return fail(res, 400, 'content required');
+  }
 
   const p = ensurePool();
   const conn = await p.getConnection();
+
   try {
     await conn.beginTransaction();
 
-    let depth = 0, rootId = null;
+    let depth = 0;
+    let rootId = null;
+
+    // 대댓글인 경우 부모 코멘트 정보 조회
     if (parentId) {
-      const [[parent]] = await conn.query('SELECT cmt_id, cmt_depth, cmt_thread_root_cmt_id FROM comments WHERE cmt_id=?', [parentId]);
-      if (!parent) { await conn.rollback(); return fail(res, 404, 'parent not found'); }
+      const [[parent]] = await conn.query(
+        'SELECT cmt_id, cmt_depth, cmt_thread_root_cmt_id FROM comments WHERE cmt_id=?',
+        [parentId]
+      );
+      if (!parent) {
+        await conn.rollback();
+        return fail(res, 404, 'parent not found');
+      }
+
       depth = Math.min(4, Number(parent.cmt_depth || 0) + 1);
       rootId = parent.cmt_thread_root_cmt_id ?? parent.cmt_id;
     }
+
+    // 코멘트 저장
     const [r] = await conn.execute(
-      `INSERT INTO comments (cmt_post_id, cmt_user_id, cmt_parent_cmt_id, cmt_thread_root_cmt_id, cmt_depth, cmt_content)
-       VALUES (?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO comments (
+          cmt_post_id,
+          cmt_user_id,
+          cmt_parent_cmt_id,
+          cmt_thread_root_cmt_id,
+          cmt_depth,
+          cmt_content
+        )
+        VALUES (?, ?, ?, ?, ?, ?)`,
       [postId, userId, parentId ?? null, rootId, depth, content]
     );
 
-    // Notification target: post author
-    const [[post]] = await conn.query('SELECT post_user_id FROM posts WHERE post_id=?', [postId]);
-    const targetUser = post?.post_user_id;
-    if (targetUser && Number(targetUser) !== userId) {
+    // 알림용: 게시글 작성자 조회
+    const [[post]] = await conn.query(
+      'SELECT post_user_id FROM posts WHERE post_id=?',
+      [postId]
+    );
+
+    if (post && post.post_user_id && Number(post.post_user_id) !== userId) {
+      const targetUser = Number(post.post_user_id);
+
       await conn.execute(
-        `INSERT INTO notifications (noti_user_id, noti_type, noti_post_id, noti_from_user_id, payload)
+        `INSERT INTO notifications (
+           noti_user_id,
+           noti_type,
+           noti_post_id,
+           noti_from_user_id,
+           payload
+         )
          VALUES (?, 'comment', ?, ?, JSON_OBJECT('comment_id', ?, 'content', ?))`,
         [targetUser, postId, userId, r.insertId, content]
       );
+
+      // (선택) 푸시 웹훅
+      if (cfg.pushWebhook) {
+        try {
+          const resp = await fetch(cfg.pushWebhook, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              type: 'comment',
+              post_id: postId,
+              to_user_id: targetUser,
+              from_user_id: userId,
+              comment_id: r.insertId,
+              content,
+            }),
+          });
+          console.log('[PUSH WEBHOOK comment]', resp.status);
+        } catch (e) {
+          console.warn('[PUSH WEBHOOK FAIL]', e.message);
+        }
+      }
     }
 
     await conn.commit();
-
-    // Optional webhook push
-    if (cfg.pushWebhook && targetUser && Number(targetUser) !== userId) {
-      try {
-        const resp = await fetch(cfg.pushWebhook, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ type: 'comment', post_id: postId, to_user_id: targetUser, from_user_id: userId, comment_id: r.insertId, content }),
-        });
-        console.log('[PUSH WEBHOOK comment]', resp.status);
-      } catch(e) { console.warn('[PUSH WEBHOOK FAIL]', e.message); }
-    }
-
-    ok(res, { comment_id: r.insertId });
+    return ok(res, { comment_id: r.insertId });
   } catch (e) {
     try { await conn.rollback(); } catch {}
     console.error('[COMMENT CREATE]', e);
-    fail(res, 500, 'create failed');
-  } finally { conn.release(); }
+    return fail(res, 500, 'create failed');
+  } finally {
+    conn.release();
+  }
 });
+
 
 // Update comment
 app.put('/comments/:id', authRequired, adminOrOwner(async (req) => {
