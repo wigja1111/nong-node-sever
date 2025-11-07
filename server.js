@@ -772,18 +772,21 @@ app.get('/posts/:id/comments', async (req, res) => {
 // Create comment (root or reply) + create notifications
 app.post('/posts/:id/comments', authRequired, async (req, res) => {
   const postId = Number(req.params.id);
-  const userId = Number(req.user.id ?? req.user.uid);
   const content = (req.body?.content || '').toString().trim();
   const parentId = req.body?.parent_id ? Number(req.body.parent_id) : null;
 
   if (!postId || !Number.isFinite(postId)) {
     return fail(res, 400, 'invalid post id');
   }
-  if (!userId || !Number.isFinite(userId)) {
-    return fail(res, 401, 'invalid user');
-  }
   if (!content) {
     return fail(res, 400, 'content required');
+  }
+
+  // req.user에서 안전하게 userId 추출
+  const rawUserId = req.user && (req.user.id ?? req.user.uid);
+  const userId = Number(rawUserId);
+  if (!userId || !Number.isFinite(userId)) {
+    return fail(res, 401, 'invalid user');
   }
 
   const p = ensurePool();
@@ -795,7 +798,7 @@ app.post('/posts/:id/comments', authRequired, async (req, res) => {
     let depth = 0;
     let rootId = null;
 
-    // 대댓글인 경우 부모 코멘트 정보 조회
+    // 대댓글이면 부모 코멘트 확인
     if (parentId) {
       const [[parent]] = await conn.query(
         'SELECT cmt_id, cmt_depth, cmt_thread_root_cmt_id FROM comments WHERE cmt_id=?',
@@ -807,68 +810,26 @@ app.post('/posts/:id/comments', authRequired, async (req, res) => {
       }
 
       depth = Math.min(4, Number(parent.cmt_depth || 0) + 1);
-      rootId = parent.cmt_thread_root_cmt_id ?? parent.cmt_id;
+      rootId = parent.cmt_thread_root_cmt_id || parent.cmt_id;
     }
 
-    // 코멘트 저장
+    // 댓글 INSERT
     const [r] = await conn.execute(
       `INSERT INTO comments (
-          cmt_post_id,
-          cmt_user_id,
-          cmt_parent_cmt_id,
-          cmt_thread_root_cmt_id,
-          cmt_depth,
-          cmt_content
-        )
-        VALUES (?, ?, ?, ?, ?, ?)`,
+         cmt_post_id,
+         cmt_user_id,
+         cmt_parent_cmt_id,
+         cmt_thread_root_cmt_id,
+         cmt_depth,
+         cmt_content,
+         cmt_created_at
+       )
+       VALUES (?, ?, ?, ?, ?, ?, NOW())`,
       [postId, userId, parentId ?? null, rootId, depth, content]
     );
 
-    // 알림용: 게시글 작성자 조회
-    const [[post]] = await conn.query(
-      'SELECT post_user_id FROM posts WHERE post_id=?',
-      [postId]
-    );
-
-    if (post && post.post_user_id && Number(post.post_user_id) !== userId) {
-      const targetUser = Number(post.post_user_id);
-
-      await conn.execute(
-        `INSERT INTO notifications (
-           noti_user_id,
-           noti_type,
-           noti_post_id,
-           noti_from_user_id,
-           payload
-         )
-         VALUES (?, 'comment', ?, ?, JSON_OBJECT('comment_id', ?, 'content', ?))`,
-        [targetUser, postId, userId, r.insertId, content]
-      );
-
-      // (선택) 푸시 웹훅
-      if (cfg.pushWebhook) {
-        try {
-          const resp = await fetch(cfg.pushWebhook, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              type: 'comment',
-              post_id: postId,
-              to_user_id: targetUser,
-              from_user_id: userId,
-              comment_id: r.insertId,
-              content,
-            }),
-          });
-          console.log('[PUSH WEBHOOK comment]', resp.status);
-        } catch (e) {
-          console.warn('[PUSH WEBHOOK FAIL]', e.message);
-        }
-      }
-    }
-
     await conn.commit();
-    return ok(res, { comment_id: r.insertId });
+    return ok(res, { ok: true, comment_id: r.insertId });
   } catch (e) {
     try { await conn.rollback(); } catch {}
     console.error('[COMMENT CREATE]', e);
