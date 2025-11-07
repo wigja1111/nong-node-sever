@@ -12,7 +12,6 @@ import rateLimit from 'express-rate-limit';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import multer from 'multer';
-import sharp from 'sharp'; // 이미지 최적화
 import { randomUUID, createHash } from 'crypto';
 
 // -------------------- Config --------------------
@@ -75,46 +74,6 @@ const upload = multer({
     cb(null, true);
   },
 });
-
-/** ===== 이미지 최적화 유틸 =====
- * 업로드된 이미지 버퍼가 1MB(1,048,576 bytes)를 초과하면
- * WebP 재인코딩(+필요 시 리사이즈)으로 1MB 이하로 줄입니다.
- */
-const ONE_MB = 1024 * 1024;
-
-/**
- * @param {Buffer} originalBuffer 원본 이미지 버퍼
- * @returns {Promise<{buffer:Buffer, mimetype:string|null}>} 최적화된 버퍼와 새 MIME (없으면 null)
- */
-async function optimizeToUnder1MB(originalBuffer) {
-  if (!originalBuffer || originalBuffer.length <= ONE_MB) {
-    return { buffer: originalBuffer, mimetype: null };
-  }
-  let meta = {};
-  try { meta = await sharp(originalBuffer).metadata(); } catch {}
-  // 1차: 품질만 낮춰 시도 (90 -> 50)
-  for (let q = 90; q >= 50; q -= 10) {
-    const out = await sharp(originalBuffer).webp({ quality: q }).toBuffer();
-    if (out.length <= ONE_MB) return { buffer: out, mimetype: 'image/webp' };
-  }
-  // 2차: 가로폭 85%씩 축소하며 품질(70 -> 40) 탐색
-  let width = typeof meta.width === 'number' ? meta.width : 2048;
-  while (width > 320) {
-    width = Math.max(320, Math.round(width * 0.85));
-    for (let q = 70; q >= 40; q -= 10) {
-      const out = await sharp(originalBuffer)
-        .resize({ width, withoutEnlargement: true })
-        .webp({ quality: q })
-        .toBuffer();
-      if (out.length <= ONE_MB) return { buffer: out, mimetype: 'image/webp' };
-    }
-    if (width === 320) break;
-  }
-  // 3차: 최저 품질 fallback
-  const fallback = await sharp(originalBuffer).webp({ quality: 40 }).toBuffer();
-  return { buffer: fallback, mimetype: 'image/webp' };
-}
-
 
 // Helpers
 const ok = (res, data = {}) => res.json({ ok: true, ...data });
@@ -514,10 +473,7 @@ app.post('/posts', authRequired, upload.array('images', cfg.maxImageFiles), asyn
       const q = 'INSERT INTO post_images (img_post_id, img_mime, img_size, img_data) VALUES (?, ?, ?, ?)';
       for (const f of images) {
         if (!f.mimetype?.startsWith('image/')) continue;
-        const { buffer: optBuf, mimetype: newMime } = await optimizeToUnder1MB(f.buffer);
-        const finalBuf = optBuf || f.buffer;
-        const finalMime = newMime || f.mimetype;
-        await conn.execute(q, [postId, finalMime, finalBuf.length, finalBuf]);
+        await conn.execute(q, [postId, f.mimetype, f.size, f.buffer]);
       }
     }
     await conn.commit();
@@ -959,7 +915,7 @@ app.post('/me/avatar', authRequired, upload.single('file'), async (req, res) => 
       `INSERT INTO user_avatars (ua_user_id, ua_mime, ua_size, ua_data)
        VALUES (?, ?, ?, ?)
        ON DUPLICATE KEY UPDATE ua_mime=VALUES(ua_mime), ua_size=VALUES(ua_size), ua_data=VALUES(ua_data)`,
-      [uid, (await (async()=>{const o=await optimizeToUnder1MB(f.buffer); f._optimized=o; return o.mimetype||f.mimetype;})()), (f._optimized?.buffer||f.buffer).length, (f._optimized?.buffer||f.buffer)]
+      [uid, f.mimetype, f.size, f.buffer]
     );
     ok(res, { updated: true });
   } catch (e) {
