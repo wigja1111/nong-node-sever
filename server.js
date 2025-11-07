@@ -1388,6 +1388,156 @@ app.put('/users/me/settings', authRequired, async (req, res) => {
     conn.release();
   }
 });
+// 내 이름(user_name) 변경
+app.put('/users/me/name', authRequired, async (req, res) => {
+  const rid = req.rid || 'no-rid';
+  const { name } = req.body || {};
+
+  // 1) 기본 검증
+  if (name === undefined || name === null) {
+    console.warn('[USER NAME][VALIDATION] missing', { rid, body: req.body });
+    return res.status(400).json({
+      ok: false,
+      code: 'MISSING_NAME',
+      message: '새 이름을 입력하세요.',
+    });
+  }
+
+  if (typeof name !== 'string') {
+    console.warn('[USER NAME][VALIDATION] not_string', { rid, typeof: typeof name });
+    return res.status(400).json({
+      ok: false,
+      code: 'INVALID_TYPE',
+      message: '이름 형식이 올바르지 않습니다.',
+    });
+  }
+
+  const trimmed = name.trim();
+
+  if (!trimmed) {
+    console.warn('[USER NAME][VALIDATION] empty_after_trim', { rid, name });
+    return res.status(400).json({
+      ok: false,
+      code: 'EMPTY_NAME',
+      message: '공백만으로는 이름을 설정할 수 없습니다.',
+    });
+  }
+
+  if (trimmed.length < 2 || trimmed.length > 30) {
+    console.warn('[USER NAME][VALIDATION] length', { rid, len: trimmed.length });
+    return res.status(400).json({
+      ok: false,
+      code: 'INVALID_LENGTH',
+      message: '이름은 2~30자 사이여야 합니다.',
+    });
+  }
+
+  // 한글/영문/숫자/공백/._- 허용 (필요시 패턴 조정)
+  const re = /^[가-힣a-zA-Z0-9 _.\-]{2,30}$/;
+  if (!re.test(trimmed)) {
+    console.warn('[USER NAME][VALIDATION] pattern', { rid, trimmed });
+    return res.status(400).json({
+      ok: false,
+      code: 'INVALID_CHAR',
+      message: '허용되지 않는 문자가 포함되어 있습니다.',
+    });
+  }
+
+  const p = ensurePool();
+  const conn = await p.getConnection();
+
+  try {
+    // 2) 토큰에서 user_id 추출
+    const uid = req.user?.id ?? req.user?.uid;
+    if (!uid) {
+      console.error('[USER NAME][AUTH] no_uid_in_token', { rid, user: req.user });
+      return res.status(401).json({
+        ok: false,
+        code: 'INVALID_TOKEN',
+        message: '인증 정보가 올바르지 않습니다. 다시 로그인하세요.',
+      });
+    }
+
+    // 3) 사용자 존재 여부 확인
+    const [[user]] = await conn.query(
+      'SELECT user_id, user_name FROM users WHERE user_id=?',
+      [uid]
+    );
+
+    if (!user) {
+      console.warn('[USER NAME][NOT_FOUND]', { rid, uid });
+      return res.status(404).json({
+        ok: false,
+        code: 'USER_NOT_FOUND',
+        message: '사용자 정보를 찾을 수 없습니다.',
+      });
+    }
+
+    // 4) 동일 이름인 경우
+    if (user.user_name === trimmed) {
+      console.log('[USER NAME][NO_CHANGE]', {
+        rid,
+        uid,
+        name: trimmed,
+      });
+      return res.json({
+        ok: true,
+        code: 'NO_CHANGE',
+        message: '현재 사용 중인 이름과 동일합니다.',
+        user: {
+          id: user.user_id,
+          name: user.user_name,
+        },
+      });
+    }
+
+    // 5) 실제 업데이트
+    const [result] = await conn.execute(
+      'UPDATE users SET user_name=? WHERE user_id=?',
+      [trimmed, uid]
+    );
+
+    if (!result || result.affectedRows === 0) {
+      console.error('[USER NAME][UPDATE_FAIL] no_rows_affected', {
+        rid,
+        uid,
+        next: trimmed,
+      });
+      return res.status(500).json({
+        ok: false,
+        code: 'UPDATE_FAILED',
+        message: '이름 변경에 실패했습니다. 다시 시도해주세요.',
+      });
+    }
+
+    console.log('[USER NAME][UPDATED]', {
+      rid,
+      uid,
+      prev: user.user_name,
+      next: trimmed,
+    });
+
+    // 클라이언트에서 바로 화면에 메시지/정보 표시 가능
+    return res.json({
+      ok: true,
+      code: 'UPDATED',
+      message: '이름이 변경되었습니다.',
+      user: {
+        id: user.user_id,
+        name: trimmed,
+      },
+    });
+  } catch (err) {
+    console.error('[USER NAME][ERROR]', { rid, error: err?.message });
+    return res.status(500).json({
+      ok: false,
+      code: 'SERVER_ERROR',
+      message: '서버 오류로 이름 변경에 실패했습니다.',
+    });
+  } finally {
+    conn.release();
+  }
+});
 
 // -------------------- 404 & Error --------------------
 app.use((req, res) => {
