@@ -576,61 +576,120 @@ app.post(
 );
 
 // Post 리스트 (me 필터 포함)
+// 게시글 목록 + 이미지 URL 포함
 app.get('/posts', async (req, res) => {
-  const { cat_id, page = 1, size = 10, me } = req.query;
-  const limit = Math.max(1, Math.min(Number(size) || 10, 50));
-  const offset = (Math.max(1, Number(page) || 1) - 1) * limit;
+  const limit = Number(req.query.limit) || 50;
+  const offset = Number(req.query.offset) || 0;
+  const myId = req.user?.user_id || 0;
 
-  const authHeader = req.headers.authorization || '';
-  const token = authHeader.startsWith('Bearer ')
-    ? authHeader.slice(7)
-    : null;
-  let authed = null;
-  if (token) {
-    try {
-      authed = jwt.verify(token, cfg.jwtSecret);
-    } catch {
-      /* ignore */
-    }
-  }
+  const [rows] = await db.query(
+    `
+    SELECT
+      p.post_id,
+      p.post_content,
+      p.post_priority,
+      p.post_like,
+      p.created_at,
+      p.updated_at,
+      u.user_id,
+      u.user_name,
+      c.cat_id,
+      c.cat_name,
+      IF(pl.user_id IS NULL, 0, 1) AS liked,
+      -- 🔽 게시글 이미지 URL 배열
+      COALESCE(
+        JSON_ARRAYAGG(
+          CASE
+            WHEN pi.img_url IS NOT NULL THEN pi.img_url
+            ELSE NULL
+          END
+        ),
+        JSON_ARRAY()
+      ) AS img_urls
+    FROM posts p
+    JOIN users u ON u.user_id = p.post_user_id
+    LEFT JOIN categories c ON c.cat_id = p.post_cat_id
+    LEFT JOIN post_likes pl
+      ON pl.post_id = p.post_id AND pl.user_id = ?
+    LEFT JOIN post_images pi
+      ON pi.img_post_id = p.post_id
+    GROUP BY
+      p.post_id,
+      p.post_content,
+      p.post_priority,
+      p.post_like,
+      p.created_at,
+      p.updated_at,
+      u.user_id,
+      u.user_name,
+      c.cat_id,
+      c.cat_name,
+      liked
+    ORDER BY p.post_id DESC
+    LIMIT ? OFFSET ?
+    `,
+    [myId, limit, offset]
+  );
 
-  const p = ensurePool();
-  const conn = await p.getConnection();
-  try {
-    const params = [];
-    let where = ' WHERE 1=1 ';
-    if (cat_id) {
-      where += ' AND p.post_cat_id=? ';
-      params.push(Number(cat_id));
-    }
-    if (me && authed?.id) {
-      where += ' AND p.post_user_id=? ';
-      params.push(Number(authed.id));
-    }
-
-    const sql = `
-      SELECT p.post_id, p.post_content, p.post_priority, p.post_like, p.created_at, p.updated_at,
-             u.user_id, u.user_name, c.cat_id, c.cat_name,
-             IF(pl.pl_user_id IS NULL, 0, 1) AS liked
-        FROM posts p
-        LEFT JOIN users u ON u.user_id = p.post_user_id
-        LEFT JOIN categories c ON c.cat_id = p.post_cat_id
-        LEFT JOIN post_likes pl
-               ON pl.pl_post_id = p.post_id
-              AND pl.pl_user_id = ${authed?.id ? Number(authed.id) : 0}
-       ${where}
-       ORDER BY p.post_priority DESC, p.created_at DESC
-       LIMIT ? OFFSET ?`;
-    params.push(limit, offset);
-    const [rows] = await conn.execute(sql, params);
-    ok(res, { rows, page: Number(page), size: limit });
-  } catch (e) {
-    console.error('[POST LIST]', e);
-    fail(res, 500, 'list failed');
-  } finally {
-    conn.release();
-  }
+  // Flutter에서 바로 쓸 수 있게 그대로 반환
+  ok(res, { ok: true, rows });
 });
+
+// app.get('/posts', async (req, res) => {
+//   const { cat_id, page = 1, size = 10, me } = req.query;
+//   const limit = Math.max(1, Math.min(Number(size) || 10, 50));
+//   const offset = (Math.max(1, Number(page) || 1) - 1) * limit;
+
+//   const authHeader = req.headers.authorization || '';
+//   const token = authHeader.startsWith('Bearer ')
+//     ? authHeader.slice(7)
+//     : null;
+//   let authed = null;
+//   if (token) {
+//     try {
+//       authed = jwt.verify(token, cfg.jwtSecret);
+//     } catch {
+//       /* ignore */
+//     }
+//   }
+
+//   const p = ensurePool();
+//   const conn = await p.getConnection();
+//   try {
+//     const params = [];
+//     let where = ' WHERE 1=1 ';
+//     if (cat_id) {
+//       where += ' AND p.post_cat_id=? ';
+//       params.push(Number(cat_id));
+//     }
+//     if (me && authed?.id) {
+//       where += ' AND p.post_user_id=? ';
+//       params.push(Number(authed.id));
+//     }
+
+//     const sql = `
+//       SELECT p.post_id, p.post_content, p.post_priority, p.post_like, p.created_at, p.updated_at,
+//              u.user_id, u.user_name, c.cat_id, c.cat_name,
+//              IF(pl.pl_user_id IS NULL, 0, 1) AS liked
+//         FROM posts p
+//         LEFT JOIN users u ON u.user_id = p.post_user_id
+//         LEFT JOIN categories c ON c.cat_id = p.post_cat_id
+//         LEFT JOIN post_likes pl
+//                ON pl.pl_post_id = p.post_id
+//               AND pl.pl_user_id = ${authed?.id ? Number(authed.id) : 0}
+//        ${where}
+//        ORDER BY p.post_priority DESC, p.created_at DESC
+//        LIMIT ? OFFSET ?`;
+//     params.push(limit, offset);
+//     const [rows] = await conn.execute(sql, params);
+//     ok(res, { rows, page: Number(page), size: limit });
+//   } catch (e) {
+//     console.error('[POST LIST]', e);
+//     fail(res, 500, 'list failed');
+//   } finally {
+//     conn.release();
+//   }
+// });
 
 // Post 상세
 app.get('/posts/:id', async (req, res) => {
