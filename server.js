@@ -1706,6 +1706,41 @@ app.put('/users/me/name', authRequired, async (req, res) => {
     conn.release();
   }
 });
+const path = require('path');
+const fs = require('fs');
+
+const AVATAR_DIR = path.join(__dirname, 'uploads', 'avatars'); // 네가 실제 쓰는 경로로 맞춰
+
+// 유저 아바타 조회
+app.get('/users/:id/avatar', async (req, res) => {
+  const userId = req.params.id;
+
+  try {
+    const [rows] = await db.query(
+      'SELECT user_avatar FROM users WHERE user_id = ? LIMIT 1',
+      [userId]
+    );
+
+    // DB에 정보 없으면 404
+    if (!rows.length || !rows[0].user_avatar) {
+      return res.status(404).json({ ok: false, message: 'no avatar' });
+    }
+
+    const filename = rows[0].user_avatar;
+    const filePath = path.join(AVATAR_DIR, filename);
+
+    // 파일이 실제 없으면 404
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({ ok: false, message: 'no avatar file' });
+    }
+
+    // 실제 이미지 전송 (Flutter는 statusCode만 관심 있음)
+    return res.sendFile(filePath);
+  } catch (err) {
+    console.error('GET /users/:id/avatar error', err);
+    return res.status(500).json({ ok: false });
+  }
+});
 
 // -------------------- 404 & Error --------------------
 app.use((req, res) => {
