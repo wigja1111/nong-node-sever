@@ -576,7 +576,6 @@ app.post(
 );
 
 // Post 리스트 (me 필터 포함)
-// Post 리스트 (me 필터 + 이미지 URL 포함)
 app.get('/posts', async (req, res) => {
   const { cat_id, page = 1, size = 10, me } = req.query;
   const limit = Math.max(1, Math.min(Number(size) || 10, 50));
@@ -586,94 +585,45 @@ app.get('/posts', async (req, res) => {
   const token = authHeader.startsWith('Bearer ')
     ? authHeader.slice(7)
     : null;
-
   let authed = null;
   if (token) {
     try {
       authed = jwt.verify(token, cfg.jwtSecret);
     } catch {
-      // 토큰 에러는 무시하고 비로그인 상태로 취급
+      /* ignore */
     }
   }
 
   const p = ensurePool();
   const conn = await p.getConnection();
-
   try {
     const params = [];
     let where = ' WHERE 1=1 ';
-
     if (cat_id) {
       where += ' AND p.post_cat_id=? ';
       params.push(Number(cat_id));
     }
-
     if (me && authed?.id) {
       where += ' AND p.post_user_id=? ';
       params.push(Number(authed.id));
     }
 
-    const likeUserId = authed?.id ? Number(authed.id) : 0;
-
     const sql = `
-      SELECT
-        p.post_id,
-        p.post_content,
-        p.post_priority,
-        p.post_like,
-        p.created_at,
-        p.updated_at,
-        u.user_id,
-        u.user_name,
-        c.cat_id,
-        c.cat_name,
-        IF(pl.pl_user_id IS NULL, 0, 1) AS liked
-      FROM posts p
-      LEFT JOIN users u
-        ON u.user_id = p.post_user_id
-      LEFT JOIN categories c
-        ON c.cat_id = p.post_cat_id
-      LEFT JOIN post_likes pl
-        ON pl.pl_post_id = p.post_id
-       AND pl.pl_user_id = ?
-      ${where}
-      ORDER BY p.post_priority DESC, p.created_at DESC
-      LIMIT ? OFFSET ?
-    `;
-
-    params.unshift(likeUserId); // pl.pl_user_id 바인딩
+      SELECT p.post_id, p.post_content, p.post_priority, p.post_like, p.created_at, p.updated_at,
+             u.user_id, u.user_name, c.cat_id, c.cat_name,
+             IF(pl.pl_user_id IS NULL, 0, 1) AS liked
+        FROM posts p
+        LEFT JOIN users u ON u.user_id = p.post_user_id
+        LEFT JOIN categories c ON c.cat_id = p.post_cat_id
+        LEFT JOIN post_likes pl
+               ON pl.pl_post_id = p.post_id
+              AND pl.pl_user_id = ${authed?.id ? Number(authed.id) : 0}
+       ${where}
+       ORDER BY p.post_priority DESC, p.created_at DESC
+       LIMIT ? OFFSET ?`;
     params.push(limit, offset);
-
     const [rows] = await conn.execute(sql, params);
-
-    // 🔹 여기서 각 post_id에 연결된 이미지 URL들을 붙여준다.
-    const postIds = rows.map((r) => r.post_id);
-    let imgsByPost = {};
-
-    if (postIds.length > 0) {
-      const [imgs] = await conn.query(
-        'SELECT img_id, img_post_id FROM post_images WHERE img_post_id IN (?)',
-        [postIds]
-      );
-
-      for (const img of imgs) {
-        const pid = img.img_post_id;
-        if (!imgsByPost[pid]) imgsByPost[pid] = [];
-        // Flutter 쪽에서 바로 쓸 수 있는 상대 경로(URL)
-        imgsByPost[pid].push(`/posts/${pid}/images/${img.img_id}`);
-      }
-    }
-
-    const rowsWithImages = rows.map((r) => ({
-      ...r,
-      img_urls: imgsByPost[r.post_id] || [],
-    }));
-
-    ok(res, {
-      rows: rowsWithImages,
-      page: Number(page),
-      size: limit,
-    });
+    ok(res, { rows, page: Number(page), size: limit });
   } catch (e) {
     console.error('[POST LIST]', e);
     fail(res, 500, 'list failed');
@@ -681,7 +631,6 @@ app.get('/posts', async (req, res) => {
     conn.release();
   }
 });
-
 
 // Post 상세
 app.get('/posts/:id', async (req, res) => {
@@ -807,8 +756,6 @@ app.get('/images/:imgId', async (req, res) => {
     conn.release();
   }
 });
-<<<<<<< HEAD
-=======
 // 기존 게시글에 이미지 추가 업로드
 app.post(
   '/posts/:id/images',
@@ -865,7 +812,59 @@ app.post(
     }
   }
 );
->>>>>>> parent of 41fac73 ( server image delete)
+// 게시글 이미지 삭제
+app.delete(
+  '/posts/:id/images/:imgId',
+  authRequired,
+  adminOrOwner(async (req) => {
+    const postId = Number(req.params.id);
+    const imgId = Number(req.params.imgId);
+
+    const p = ensurePool();
+    const conn = await p.getConnection();
+    try {
+      // 이미지가 속한 게시글의 작성자 확인
+      const [[row]] = await conn.query(
+        `SELECT p.post_user_id
+           FROM post_images i
+           JOIN posts p ON p.post_id = i.img_post_id
+          WHERE i.img_id = ? AND i.img_post_id = ?`,
+        [imgId, postId]
+      );
+      // adminOrOwner 에게 post_user_id 넘김
+      return row?.post_user_id;
+    } finally {
+      conn.release();
+    }
+  }),
+  async (req, res) => {
+    const postId = Number(req.params.id);
+    const imgId = Number(req.params.imgId);
+
+    if (!postId || !Number.isFinite(postId) || !imgId || !Number.isFinite(imgId)) {
+      return fail(res, 400, 'invalid ids');
+    }
+
+    const p = ensurePool();
+    const conn = await p.getConnection();
+    try {
+      const [r] = await conn.execute(
+        'DELETE FROM post_images WHERE img_id = ? AND img_post_id = ?',
+        [imgId, postId]
+      );
+      ok(res, { deleted: r.affectedRows });
+    } catch (e) {
+      console.error('[POST IMAGE DELETE]', e);
+      fail(res, 500, 'delete failed');
+    } finally {
+      conn.release();
+    }
+  }
+);
+
+
+
+
 
 // Post 수정/삭제 (기존 로직 유지 - 생략 없이 그대로)
 
