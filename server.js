@@ -1529,7 +1529,33 @@ app.put('/users/me/settings', authRequired, async (req, res) => {
   const { nickname, notify_email, notify_push } = req.body || {};
   const p = ensurePool();
   const conn = await p.getConnection();
+
   try {
+    const trimmed =
+      typeof nickname === 'string' ? nickname.trim() : null;
+
+    // 닉네임 값이 들어온 경우만 중복 체크
+    if (trimmed) {
+      const [dups] = await conn.query(
+        'SELECT us_user_id FROM user_settings WHERE us_nickname = ? AND us_user_id <> ? LIMIT 1',
+        [trimmed, uid]
+      );
+
+      if (dups.length) {
+        console.warn('[NICKNAME DUP]', {
+          uid,
+          nickname: trimmed,
+          conflictUserId: dups[0].us_user_id,
+        });
+
+        return res.status(409).json({
+          ok: false,
+          code: 'NICKNAME_TAKEN',
+          message: '이미 사용 중인 닉네임입니다.',
+        });
+      }
+    }
+
     await conn.execute(
       `INSERT INTO user_settings
          (us_user_id, us_nickname, us_notify_email, us_notify_push)
@@ -1538,8 +1564,19 @@ app.put('/users/me/settings', authRequired, async (req, res) => {
          us_nickname=VALUES(us_nickname),
          us_notify_email=VALUES(us_notify_email),
          us_notify_push=VALUES(us_notify_push)`,
-      [uid, nickname ?? null, notify_email ? 1 : 0, notify_push ? 1 : 0]
+      [
+        uid,
+        trimmed ?? null,
+        notify_email ? 1 : 0,
+        notify_push ? 1 : 0,
+      ]
     );
+
+    console.log('[NICKNAME UPDATED]', {
+      uid,
+      nickname: trimmed,
+    });
+
     ok(res, { updated: true });
   } catch (e) {
     console.error('[USER SETTINGS]', e);
@@ -1548,6 +1585,7 @@ app.put('/users/me/settings', authRequired, async (req, res) => {
     conn.release();
   }
 });
+
 // 내 이름(user_name) 변경
 app.put('/users/me/name', authRequired, async (req, res) => {
   const rid = req.rid || 'no-rid';
