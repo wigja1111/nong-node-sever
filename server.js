@@ -576,6 +576,7 @@ app.post(
 );
 
 // Post 리스트 (me 필터 포함)
+// Post 리스트 (me 필터 + 이미지 URL 포함)
 app.get('/posts', async (req, res) => {
   const { cat_id, page = 1, size = 10, me } = req.query;
   const limit = Math.max(1, Math.min(Number(size) || 10, 50));
@@ -585,45 +586,94 @@ app.get('/posts', async (req, res) => {
   const token = authHeader.startsWith('Bearer ')
     ? authHeader.slice(7)
     : null;
+
   let authed = null;
   if (token) {
     try {
       authed = jwt.verify(token, cfg.jwtSecret);
     } catch {
-      /* ignore */
+      // 토큰 에러는 무시하고 비로그인 상태로 취급
     }
   }
 
   const p = ensurePool();
   const conn = await p.getConnection();
+
   try {
     const params = [];
     let where = ' WHERE 1=1 ';
+
     if (cat_id) {
       where += ' AND p.post_cat_id=? ';
       params.push(Number(cat_id));
     }
+
     if (me && authed?.id) {
       where += ' AND p.post_user_id=? ';
       params.push(Number(authed.id));
     }
 
+    const likeUserId = authed?.id ? Number(authed.id) : 0;
+
     const sql = `
-      SELECT p.post_id, p.post_content, p.post_priority, p.post_like, p.created_at, p.updated_at,
-             u.user_id, u.user_name, c.cat_id, c.cat_name,
-             IF(pl.pl_user_id IS NULL, 0, 1) AS liked
-        FROM posts p
-        LEFT JOIN users u ON u.user_id = p.post_user_id
-        LEFT JOIN categories c ON c.cat_id = p.post_cat_id
-        LEFT JOIN post_likes pl
-               ON pl.pl_post_id = p.post_id
-              AND pl.pl_user_id = ${authed?.id ? Number(authed.id) : 0}
-       ${where}
-       ORDER BY p.post_priority DESC, p.created_at DESC
-       LIMIT ? OFFSET ?`;
+      SELECT
+        p.post_id,
+        p.post_content,
+        p.post_priority,
+        p.post_like,
+        p.created_at,
+        p.updated_at,
+        u.user_id,
+        u.user_name,
+        c.cat_id,
+        c.cat_name,
+        IF(pl.pl_user_id IS NULL, 0, 1) AS liked
+      FROM posts p
+      LEFT JOIN users u
+        ON u.user_id = p.post_user_id
+      LEFT JOIN categories c
+        ON c.cat_id = p.post_cat_id
+      LEFT JOIN post_likes pl
+        ON pl.pl_post_id = p.post_id
+       AND pl.pl_user_id = ?
+      ${where}
+      ORDER BY p.post_priority DESC, p.created_at DESC
+      LIMIT ? OFFSET ?
+    `;
+
+    params.unshift(likeUserId); // pl.pl_user_id 바인딩
     params.push(limit, offset);
+
     const [rows] = await conn.execute(sql, params);
-    ok(res, { rows, page: Number(page), size: limit });
+
+    // 🔹 여기서 각 post_id에 연결된 이미지 URL들을 붙여준다.
+    const postIds = rows.map((r) => r.post_id);
+    let imgsByPost = {};
+
+    if (postIds.length > 0) {
+      const [imgs] = await conn.query(
+        'SELECT img_id, img_post_id FROM post_images WHERE img_post_id IN (?)',
+        [postIds]
+      );
+
+      for (const img of imgs) {
+        const pid = img.img_post_id;
+        if (!imgsByPost[pid]) imgsByPost[pid] = [];
+        // Flutter 쪽에서 바로 쓸 수 있는 상대 경로(URL)
+        imgsByPost[pid].push(`/posts/${pid}/images/${img.img_id}`);
+      }
+    }
+
+    const rowsWithImages = rows.map((r) => ({
+      ...r,
+      img_urls: imgsByPost[r.post_id] || [],
+    }));
+
+    ok(res, {
+      rows: rowsWithImages,
+      page: Number(page),
+      size: limit,
+    });
   } catch (e) {
     console.error('[POST LIST]', e);
     fail(res, 500, 'list failed');
@@ -631,6 +681,7 @@ app.get('/posts', async (req, res) => {
     conn.release();
   }
 });
+
 
 // Post 상세
 app.get('/posts/:id', async (req, res) => {
