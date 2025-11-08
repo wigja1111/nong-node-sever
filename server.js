@@ -812,6 +812,59 @@ app.post(
     }
   }
 );
+// 게시글 이미지 삭제
+app.delete(
+  '/posts/:id/images/:imgId',
+  authRequired,
+  adminOrOwner(async (req) => {
+    const postId = Number(req.params.id);
+    const imgId = Number(req.params.imgId);
+
+    const p = ensurePool();
+    const conn = await p.getConnection();
+    try {
+      // 이미지가 속한 게시글의 작성자 확인
+      const [[row]] = await conn.query(
+        `SELECT p.post_user_id
+           FROM post_images i
+           JOIN posts p ON p.post_id = i.img_post_id
+          WHERE i.img_id = ? AND i.img_post_id = ?`,
+        [imgId, postId]
+      );
+      // adminOrOwner 에게 post_user_id 넘김
+      return row?.post_user_id;
+    } finally {
+      conn.release();
+    }
+  }),
+  async (req, res) => {
+    const postId = Number(req.params.id);
+    const imgId = Number(req.params.imgId);
+
+    if (!postId || !Number.isFinite(postId) || !imgId || !Number.isFinite(imgId)) {
+      return fail(res, 400, 'invalid ids');
+    }
+
+    const p = ensurePool();
+    const conn = await p.getConnection();
+    try {
+      const [r] = await conn.execute(
+        'DELETE FROM post_images WHERE img_id = ? AND img_post_id = ?',
+        [imgId, postId]
+      );
+      ok(res, { deleted: r.affectedRows });
+    } catch (e) {
+      console.error('[POST IMAGE DELETE]', e);
+      fail(res, 500, 'delete failed');
+    } finally {
+      conn.release();
+    }
+  }
+);
+
+
+
+
 
 // Post 수정/삭제 (기존 로직 유지 - 생략 없이 그대로)
 
