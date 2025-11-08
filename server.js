@@ -807,115 +807,6 @@ app.get('/images/:imgId', async (req, res) => {
     conn.release();
   }
 });
-// 기존 게시글에 이미지 추가 업로드
-app.post(
-  '/posts/:id/images',
-  authRequired,
-  adminOrOwner(async (req) => {
-    // 이 이미지가 속할 게시글의 작성자(owner)를 찾는다.
-    const postId = Number(req.params.id);
-    const p = ensurePool();
-    const conn = await p.getConnection();
-    try {
-      const [[row]] = await conn.query(
-        'SELECT post_user_id FROM posts WHERE post_id=?',
-        [postId]
-      );
-      return row?.post_user_id;
-    } finally {
-      conn.release();
-    }
-  }),
-  upload.array('images', cfg.maxImageFiles),
-  async (req, res) => {
-    const postId = Number(req.params.id);
-    if (!postId || !Number.isFinite(postId)) {
-      return fail(res, 400, 'invalid post id');
-    }
-
-    const files = req.files || [];
-    if (!files.length) {
-      return fail(res, 400, 'no images uploaded');
-    }
-
-    const p = ensurePool();
-    const conn = await p.getConnection();
-    try {
-      let count = 0;
-      const sql =
-        'INSERT INTO post_images (img_post_id, img_mime, img_size, img_data) VALUES (?, ?, ?, ?)';
-      for (const f of files) {
-        if (!f.mimetype?.startsWith('image/')) continue;
-        await conn.execute(sql, [
-          postId,
-          f.mimetype,
-          f.size,
-          f.buffer,
-        ]);
-        count++;
-      }
-      ok(res, { uploaded: count });
-    } catch (e) {
-      console.error('[POST IMAGES UPLOAD]', e);
-      fail(res, 500, 'upload failed');
-    } finally {
-      conn.release();
-    }
-  }
-);
-// 게시글 이미지 삭제
-app.delete(
-  '/posts/:id/images/:imgId',
-  authRequired,
-  adminOrOwner(async (req) => {
-    const postId = Number(req.params.id);
-    const imgId = Number(req.params.imgId);
-
-    const p = ensurePool();
-    const conn = await p.getConnection();
-    try {
-      // 이미지가 속한 게시글의 작성자 확인
-      const [[row]] = await conn.query(
-        `SELECT p.post_user_id
-           FROM post_images i
-           JOIN posts p ON p.post_id = i.img_post_id
-          WHERE i.img_id = ? AND i.img_post_id = ?`,
-        [imgId, postId]
-      );
-      // adminOrOwner 에게 post_user_id 넘김
-      return row?.post_user_id;
-    } finally {
-      conn.release();
-    }
-  }),
-  async (req, res) => {
-    const postId = Number(req.params.id);
-    const imgId = Number(req.params.imgId);
-
-    if (!postId || !Number.isFinite(postId) || !imgId || !Number.isFinite(imgId)) {
-      return fail(res, 400, 'invalid ids');
-    }
-
-    const p = ensurePool();
-    const conn = await p.getConnection();
-    try {
-      const [r] = await conn.execute(
-        'DELETE FROM post_images WHERE img_id = ? AND img_post_id = ?',
-        [imgId, postId]
-      );
-      ok(res, { deleted: r.affectedRows });
-    } catch (e) {
-      console.error('[POST IMAGE DELETE]', e);
-      fail(res, 500, 'delete failed');
-    } finally {
-      conn.release();
-    }
-  }
-);
-
-
-
-
 
 // Post 수정/삭제 (기존 로직 유지 - 생략 없이 그대로)
 
@@ -1698,12 +1589,6 @@ app.put('/users/me/name', authRequired, async (req, res) => {
     conn.release();
   }
 });
-const path = require('path');
-const fs = require('fs');
-
-const AVATAR_DIR = path.join(__dirname, 'uploads', 'avatars'); // 네가 실제 쓰는 경로로 맞춰
-
-
 
 // -------------------- 404 & Error --------------------
 app.use((req, res) => {
