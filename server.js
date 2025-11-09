@@ -1531,6 +1531,12 @@ app.put('/users/me/settings', authRequired, async (req, res) => {
   const conn = await p.getConnection();
 
   try {
+     console.log('[USER SETTINGS][PUT]', {
+    uid,
+    nickname,
+    notify_email,
+    notify_push,
+  });
     const trimmed =
       typeof nickname === 'string' ? nickname.trim() : null;
 
@@ -1579,11 +1585,25 @@ app.put('/users/me/settings', authRequired, async (req, res) => {
 
     ok(res, { updated: true });
   } catch (e) {
-    console.error('[USER SETTINGS]', e);
-    fail(res, 500, 'failed');
-  } finally {
-    conn.release();
+  console.error('[USER SETTINGS][ERROR]', e?.code, e?.errno, e?.sqlMessage || e?.message);
+
+  // 상황별로 어떤 문제인지 바로 알 수 있게
+  if (e.code === 'ER_NO_SUCH_TABLE') {
+    return fail(res, 500, 'user_settings table missing');
   }
+  if (e.code === 'ER_BAD_FIELD_ERROR') {
+    return fail(res, 500, 'invalid column in user_settings query');
+  }
+  if (e.code === 'ER_NO_REFERENCED_ROW_2') {
+    // FK: users에 없는 uid로 insert하려고 할 때
+    return fail(res, 400, 'invalid user id for settings');
+  }
+
+  return fail(res, 500, 'failed');
+} finally {
+  conn.release();
+}
+
 });
 
 // 내 이름(user_name) 변경
