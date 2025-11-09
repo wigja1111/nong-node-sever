@@ -1508,6 +1508,41 @@ app.get('/notifications', authRequired, async (req, res) => {
     conn.release();
   }
 });
+// 현재 로그인한 유저 정보 조회
+app.get('/users/me', authRequired, async (req, res) => {
+  const uid = Number(req.user.id ?? req.user.uid);
+
+  if (!uid) {
+    return fail(res, 401, 'INVALID_TOKEN');
+  }
+
+  const p = ensurePool();
+  const conn = await p.getConnection();
+
+  try {
+    const [[row]] = await conn.query(
+      'SELECT user_id, user_name FROM users WHERE user_id = ?',
+      [uid]
+    );
+
+    if (!row) {
+      return fail(res, 404, 'USER_NOT_FOUND');
+    }
+
+    // ok() 헬퍼: { ok: true, ... } 형태로 응답
+    return ok(res, {
+      user: {
+        id: row.user_id,
+        name: row.user_name,
+      },
+    });
+  } catch (e) {
+    console.error('[USER ME][ERROR]', e);
+    return fail(res, 500, 'failed');
+  } finally {
+    conn.release();
+  }
+});
 
 app.get('/users/me/settings', authRequired, async (req, res) => {
   const uid = Number(req.user.id ?? req.user.uid);
