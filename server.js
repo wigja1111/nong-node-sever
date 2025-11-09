@@ -1253,17 +1253,28 @@ app.put(
 );
 
 app.post('/comments/:id', authRequired, async (req, res, next) => {
-  if (
-    (req.body?._method || '')
-      .toString()
-      .toUpperCase() === 'PUT'
-  ) {
+  const method = (req.body?._method || '')
+    .toString()
+    .toUpperCase();
+
+  if (method === 'PUT') {
+    // 댓글 수정
     return app._router.handle(
       { ...req, method: 'PUT' },
       res,
       next
     );
   }
+
+  if (method === 'DELETE') {
+    // 댓글 삭제
+    return app._router.handle(
+      { ...req, method: 'DELETE' },
+      res,
+      next
+    );
+  }
+
   return fail(res, 400, 'Unsupported method');
 });
 
