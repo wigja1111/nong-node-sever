@@ -63,6 +63,7 @@ app.use((req, res, next) => {
       `[RES] ${rid} ${req.method} ${req.url} status=${res.statusCode} ms=${Date.now() - t0}`
     );
   });
+    console.log('[REQ]', req.method, req.url);
   next();
 });
 
@@ -1009,6 +1010,7 @@ app.post(
   '/posts/:id/delete',
   authRequired,
   async (req, res, next) => {
+    console.log('[HIT] /posts/:id/delete', req.method, req.url);
     req.body = req.body || {};
     req.body._method = 'DELETE';
     return app._router.handle(
