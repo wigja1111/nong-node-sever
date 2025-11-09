@@ -1526,64 +1526,62 @@ app.get('/users/me/settings', authRequired, async (req, res) => {
 
 app.put('/users/me/settings', authRequired, async (req, res) => {
   const uid = Number(req.user.id ?? req.user.uid);
-  const { nickname, notify_email, notify_push } = req.body || {};
+  const { nickname } = req.body || {};
   const p = ensurePool();
   const conn = await p.getConnection();
 
   try {
-     console.log('[USER SETTINGS][PUT]', {
-    uid,
-    nickname,
-    notify_email,
-    notify_push,
-  });
+    console.log('[USER SETTINGS][PUT]', {
+      uid,
+      nickname,
+    });
+
     const trimmed =
       typeof nickname === 'string' ? nickname.trim() : null;
 
-    // 닉네임 값이 들어온 경우만 중복 체크
-    if (trimmed) {
-      const [dups] = await conn.query(
-        'SELECT us_user_id FROM user_settings WHERE us_nickname = ? AND us_user_id <> ? LIMIT 1',
-        [trimmed, uid]
-      );
-
-      if (dups.length) {
-        console.warn('[NICKNAME DUP]', {
-          uid,
-          nickname: trimmed,
-          conflictUserId: dups[0].us_user_id,
-        });
-
-        return res.status(409).json({
-          ok: false,
-          code: 'NICKNAME_TAKEN',
-          message: '이미 사용 중인 닉네임입니다.',
-        });
-      }
+    // 닉네임 안 들어왔으면 에러
+    if (!trimmed) {
+      return fail(res, 400, 'nickname is required');
     }
 
-    await conn.execute(
-      `INSERT INTO user_settings
-         (us_user_id, us_nickname, us_notify_email, us_notify_push)
-       VALUES (?, ?, ?, ?)
-       ON DUPLICATE KEY UPDATE
-         us_nickname=VALUES(us_nickname),
-         us_notify_email=VALUES(us_notify_email),
-         us_notify_push=VALUES(us_notify_push)`,
-      [
-        uid,
-        trimmed ?? null,
-        notify_email ? 1 : 0,
-        notify_push ? 1 : 0,
-      ]
+    // 1) 중복 체크: users.user_name에 같은 값이 다른 유저에 있는지
+    const [dups] = await conn.query(
+      'SELECT user_id FROM users WHERE user_name = ? AND user_id <> ? LIMIT 1',
+      [trimmed, uid]
     );
+
+    if (dups.length) {
+      console.warn('[NICKNAME DUP]', {
+        uid,
+        nickname: trimmed,
+        conflictUserId: dups[0].user_id,
+      });
+
+      return res.status(409).json({
+        ok: false,
+        code: 'NICKNAME_TAKEN',
+        message: '이미 사용 중인 닉네임입니다.',
+      });
+    }
+
+    // 2) 실제 업데이트: users.user_name
+    const [result] = await conn.execute(
+      'UPDATE users SET user_name = ? WHERE user_id = ?',
+      [trimmed, uid]
+    );
+
+    // 해당 유저가 없을 때
+    if (!result.affectedRows) {
+      console.warn('[NICKNAME UPDATE][NO USER]', { uid, nickname: trimmed });
+      return fail(res, 400, 'invalid user id');
+    }
 
     console.log('[NICKNAME UPDATED]', {
       uid,
       nickname: trimmed,
     });
 
-    ok(res, { updated: true });
+    return ok(res, { updated: true, nickname: trimmed });
   } catch (e) {
   console.error('[USER SETTINGS][ERROR]', e?.code, e?.errno, e?.sqlMessage || e?.message);
 
@@ -1605,6 +1603,7 @@ app.put('/users/me/settings', authRequired, async (req, res) => {
 }
 
 });
+
 
 // 내 이름(user_name) 변경
 app.put('/users/me/name', authRequired, async (req, res) => {
