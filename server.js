@@ -1035,7 +1035,10 @@ app.get('/posts/:id/comments', async (req, res) => {
          FROM comments c
          LEFT JOIN users u ON u.user_id=c.cmt_user_id
         WHERE c.cmt_post_id=?
-        ORDER BY c.created_at ASC`,
+        ORDER BY
+  COALESCE(c.cmt_thread_root_cmt_id, c.cmt_id) ASC,
+  c.cmt_depth ASC,
+  c.created_at ASC`,
       [postId]
     );
     ok(res, { rows });
