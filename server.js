@@ -12,6 +12,9 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import multer from 'multer';
 import { randomUUID, createHash } from 'crypto';
+import fs from 'fs';
+import path from 'path';
+
 
 // -------------------- Config --------------------
 const cfg = {
@@ -27,7 +30,14 @@ const cfg = {
   maxImageFiles: Number(process.env.MAX_IMAGE_FILES || 10),
   jwtSecret: process.env.JWT_SECRET || 'dev-secret-change-it',
   pushWebhook: process.env.PUSH_WEBHOOK || '',   // optional: external push webhook
+  uploadDir: process.env.UPLOAD_DIR || 'uploads',
 };
+// 이미지 업로드 루트 디렉토리
+const uploadRoot = path.join(process.cwd(), cfg.uploadDir);
+if (!fs.existsSync(uploadRoot)) {
+  fs.mkdirSync(uploadRoot, { recursive: true });
+}
+
 
 console.log('[BOOT CONFIG]', {
   DB_HOST: cfg.dbHost,
@@ -51,6 +61,8 @@ app.use(
 );
 app.use(cors({ origin: cfg.corsOrigin, credentials: false }));
 app.use(express.json({ limit: '2mb' }));
+// 업로드된 이미지 정적 서빙 (/uploads/파일명)
+app.use(`/${cfg.uploadDir}`, express.static(uploadRoot));
 
 // Request id + basic logging
 app.use((req, res, next) => {
@@ -70,6 +82,29 @@ app.use((req, res, next) => {
 // Upload (memory) — images stored in DB (LONGBLOB)
 const upload = multer({
   storage: multer.memoryStorage(),
+  limits: { fileSize: cfg.maxImageSizeMB * 1024 * 1024, files: cfg.maxImageFiles },
+  fileFilter: (_req, file, cb) => {
+    if (!file.mimetype?.startsWith('image/')) return cb(new Error('Only image uploads are allowed'));
+    cb(null, true);
+  },
+});
+
+// 게시글 이미지용 디스크 저장 multer
+const imageStorage = multer.diskStorage({
+  destination(_req, _file, cb) {
+    cb(null, uploadRoot); // /프로젝트경로/uploads
+  },
+  filename(_req, file, cb) {
+    const ext =
+      file.originalname && file.originalname.includes('.')
+        ? file.originalname.slice(file.originalname.lastIndexOf('.'))
+        : '';
+    cb(null, `${randomUUID()}${ext}`);
+  },
+});
+
+const uploadImages = multer({
+  storage: imageStorage,
   limits: { fileSize: cfg.maxImageSizeMB * 1024 * 1024, files: cfg.maxImageFiles },
   fileFilter: (_req, file, cb) => {
     if (!file.mimetype?.startsWith('image/')) return cb(new Error('Only image uploads are allowed'));
@@ -268,7 +303,7 @@ async function initSchema() {
     );
 
     await conn.query(
-      `CREATE TABLE IF NOT EXISTS \`post_images\` (
+  `CREATE TABLE IF NOT EXISTS \`post_images\` (
         \`img_id\`      BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
         \`img_post_id\` INT    UNSIGNED NOT NULL,
         \`img_mime\`    VARCHAR(80) NOT NULL,
@@ -281,7 +316,26 @@ async function initSchema() {
           FOREIGN KEY (\`img_post_id\`) REFERENCES \`posts\`(\`post_id\`)
           ON DELETE CASCADE ON UPDATE CASCADE
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`
-    );
+);
+
+// ★ 추가: 기존 DB에 img_path 컬럼 & img_data NULL 허용으로 마이그레이션
+try {
+  await conn.query(
+    'ALTER TABLE `post_images` ADD COLUMN `img_path` VARCHAR(255) NULL AFTER `img_size`'
+  );
+} catch (e) {
+  // 이미 있으면 에러 나지만 무시
+}
+
+try {
+  await conn.query(
+    'ALTER TABLE `post_images` MODIFY COLUMN `img_data` LONGBLOB NULL'
+  );
+} catch (e) {
+  // 권한/버전 문제면 로그만 보고 넘어가도 됨
+  console.warn('[post_images MIGRATE]', e.message || e);
+}
+
 
     await conn.query(
       `CREATE TABLE IF NOT EXISTS \`comments\` (
@@ -533,7 +587,7 @@ app.get('/categories', async (_req, res) => {
 app.post(
   '/posts',
   authRequired,
-  upload.array('images', cfg.maxImageFiles),
+  uploadImages.array('images', cfg.maxImageFiles), // ★ 여기 multer 변경
   async (req, res) => {
     const { cat_id, content, priority = 0 } = req.body || {};
     if (!content) return fail(res, 400, 'content required');
@@ -556,15 +610,16 @@ app.post(
 
       if (images.length) {
         const q =
-          'INSERT INTO post_images (img_post_id, img_mime, img_size, img_data) VALUES (?, ?, ?, ?)';
+          'INSERT INTO post_images (img_post_id, img_mime, img_size, img_path) VALUES (?, ?, ?, ?)';
         for (const f of images) {
           if (!f.mimetype?.startsWith('image/')) continue;
-          await conn.execute(q, [postId, f.mimetype, f.size, f.buffer]);
+          const relPath = f.filename; // uploads 폴더 안 파일명만 저장
+          await conn.execute(q, [postId, f.mimetype, f.size, relPath]);
         }
       }
       await conn.commit();
       ok(res, { post_id: postId, images_uploaded: images.length });
-    } catch (e) {
+   } catch (e) {
       try {
         await conn.rollback();
       } catch {}
@@ -648,27 +703,28 @@ app.get('/posts', async (req, res) => {
     const [rows] = await conn.execute(sql, params);
 
     // 🔹 여기서 각 post_id에 연결된 이미지 URL들을 붙여준다.
-    const postIds = rows.map((r) => r.post_id);
+        const postIds = rows.map((r) => r.post_id);
     let imgsByPost = {};
 
     if (postIds.length > 0) {
       const [imgs] = await conn.query(
-        'SELECT img_id, img_post_id FROM post_images WHERE img_post_id IN (?)',
+        'SELECT img_id, img_post_id, img_path FROM post_images WHERE img_post_id IN (?)',
         [postIds]
       );
 
       for (const img of imgs) {
         const pid = img.img_post_id;
         if (!imgsByPost[pid]) imgsByPost[pid] = [];
-        // Flutter 쪽에서 바로 쓸 수 있는 상대 경로(URL)
-        imgsByPost[pid].push(`/posts/${pid}/images/${img.img_id}`);
+        // 이제는 정적 /uploads/ 경로로 바로 접근
+        imgsByPost[pid].push(`/${cfg.uploadDir}/${img.img_path}`);
       }
     }
 
-    const rowsWithImages = rows.map((r) => ({
-      ...r,
-      img_urls: imgsByPost[r.post_id] || [],
+    const rowsWithImages = rows.map((row) => ({
+      ...row,
+      img_urls: imgsByPost[row.post_id] || [],
     }));
+
 
     ok(res, {
       rows: rowsWithImages,
@@ -720,16 +776,17 @@ app.get('/posts/:id', async (req, res) => {
     );
     if (!post) return fail(res, 404, 'not found');
 
-    const [imgs] = await conn.query(
-      'SELECT img_id, img_mime, img_size, created_at FROM post_images WHERE img_post_id=? ORDER BY img_id ASC',
+        const [imgs] = await conn.query(
+      'SELECT img_id, img_mime, img_size, img_path, created_at FROM post_images WHERE img_post_id=? ORDER BY img_id ASC',
       [id]
     );
     const base = `${req.protocol}://${req.get('host')}`;
     const images = imgs.map((i) => ({
       ...i,
-      img_url: `${base}/posts/${id}/images/${i.img_id}`,
+      img_url: `${base}/${cfg.uploadDir}/${i.img_path}`,
     }));
     ok(res, { post, images });
+
   } finally {
     conn.release();
   }
@@ -743,35 +800,47 @@ app.get('/posts/:id/images/:imgId', async (req, res) => {
   const conn = await p.getConnection();
   try {
     const [[img]] = await conn.query(
-      'SELECT img_mime, img_size, img_data, created_at FROM post_images WHERE img_post_id=? AND img_id=?',
+      'SELECT img_mime, img_size, img_path, created_at FROM post_images WHERE img_post_id=? AND img_id=?',
       [id, imgId]
     );
-    if (!img) return fail(res, 404, 'image not found');
+    if (!img || !img.img_path) return fail(res, 404, 'image not found');
 
-    const buf = img.img_data;
-    const etag = createHash('sha1').update(buf).digest('hex');
-    res.setHeader('Content-Type', img.img_mime);
-    res.setHeader(
-      'Content-Length',
-      String(img.img_size || buf.length)
-    );
-    res.setHeader(
-      'Cache-Control',
-      'public, max-age=86400, immutable'
-    );
+    const filePath = path.join(uploadRoot, img.img_path);
+    if (!fs.existsSync(filePath)) {
+      return fail(res, 404, 'file not found');
+    }
+
+    const stat = fs.statSync(filePath);
+    const etag = createHash('sha1')
+      .update(`${stat.size}-${stat.mtimeMs}`)
+      .digest('hex');
+
+    if (req.headers['if-none-match'] === etag) {
+      res.status(304).end();
+      return;
+    }
+
+    res.setHeader('Content-Type', img.img_mime || 'application/octet-stream');
+    res.setHeader('Content-Length', String(stat.size));
+    res.setHeader('Cache-Control', 'public, max-age=86400, immutable');
     res.setHeader('ETag', etag);
-    res.setHeader(
-      'Last-Modified',
-      new Date(img.created_at).toUTCString()
-    );
-    if (req.headers['if-none-match'] === etag)
-      return res.status(304).end();
+    res.setHeader('Last-Modified', new Date(img.created_at).toUTCString());
 
-    res.end(buf);
+    const stream = fs.createReadStream(filePath);
+    stream.on('error', (err) => {
+      console.error('[IMAGE STREAM ERROR]', err);
+      if (!res.headersSent) {
+        fail(res, 500, 'image read error');
+      } else {
+        res.destroy(err);
+      }
+    });
+    stream.pipe(res);
   } finally {
     conn.release();
   }
 });
+
 
 app.get('/images/:imgId', async (req, res) => {
   const imgId = Number(req.params.imgId);
@@ -779,60 +848,58 @@ app.get('/images/:imgId', async (req, res) => {
   const conn = await p.getConnection();
   try {
     const [[img]] = await conn.query(
-      'SELECT img_mime, img_size, img_data, created_at FROM post_images WHERE img_id=?',
+      'SELECT img_mime, img_size, img_path, created_at FROM post_images WHERE img_id=?',
       [imgId]
     );
-    if (!img) return fail(res, 404, 'image not found');
+    if (!img || !img.img_path) return fail(res, 404, 'image not found');
 
-    const buf = img.img_data;
-    const etag = createHash('sha1').update(buf).digest('hex');
-    res.setHeader('Content-Type', img.img_mime);
-    res.setHeader(
-      'Content-Length',
-      String(img.img_size || buf.length)
-    );
-    res.setHeader(
-      'Cache-Control',
-      'public, max-age=86400, immutable'
-    );
+    const filePath = path.join(uploadRoot, img.img_path);
+    if (!fs.existsSync(filePath)) {
+      return fail(res, 404, 'file not found');
+    }
+
+    const stat = fs.statSync(filePath);
+    const etag = createHash('sha1')
+      .update(`${stat.size}-${stat.mtimeMs}`)
+      .digest('hex');
+
+    if (req.headers['if-none-match'] === etag) {
+      res.status(304).end();
+      return;
+    }
+
+    res.setHeader('Content-Type', img.img_mime || 'application/octet-stream');
+    res.setHeader('Content-Length', String(stat.size));
+    res.setHeader('Cache-Control', 'public, max-age=86400, immutable');
     res.setHeader('ETag', etag);
-    res.setHeader(
-      'Last-Modified',
-      new Date(img.created_at).toUTCString()
-    );
-    if (req.headers['if-none-match'] === etag)
-      return res.status(304).end();
+    res.setHeader('Last-Modified', new Date(img.created_at).toUTCString());
 
-    res.end(buf);
+    const stream = fs.createReadStream(filePath);
+    stream.on('error', (err) => {
+      console.error('[IMAGE STREAM ERROR]', err);
+      if (!res.headersSent) {
+        fail(res, 500, 'image read error');
+      } else {
+        res.destroy(err);
+      }
+    });
+    stream.pipe(res);
   } finally {
     conn.release();
   }
 });
+
 // 기존 게시글에 이미지 추가 업로드
 app.post(
   '/posts/:id/images',
   authRequired,
   adminOrOwner(async (req) => {
-    // 이 이미지가 속할 게시글의 작성자(owner)를 찾는다.
-    const postId = Number(req.params.id);
-    const p = ensurePool();
-    const conn = await p.getConnection();
-    try {
-      const [[row]] = await conn.query(
-        'SELECT post_user_id FROM posts WHERE post_id=?',
-        [postId]
-      );
-      return row?.post_user_id;
-    } finally {
-      conn.release();
-    }
+    // ...
   }),
-  upload.array('images', cfg.maxImageFiles),
+  uploadImages.array('images', cfg.maxImageFiles), // ★ multer 변경
   async (req, res) => {
     const postId = Number(req.params.id);
-    if (!postId || !Number.isFinite(postId)) {
-      return fail(res, 400, 'invalid post id');
-    }
+    // ...
 
     const files = req.files || [];
     if (!files.length) {
@@ -844,17 +911,19 @@ app.post(
     try {
       let count = 0;
       const sql =
-        'INSERT INTO post_images (img_post_id, img_mime, img_size, img_data) VALUES (?, ?, ?, ?)';
+        'INSERT INTO post_images (img_post_id, img_mime, img_size, img_path) VALUES (?, ?, ?, ?)';
       for (const f of files) {
         if (!f.mimetype?.startsWith('image/')) continue;
+        const relPath = f.filename;
         await conn.execute(sql, [
           postId,
           f.mimetype,
           f.size,
-          f.buffer,
+          relPath,
         ]);
         count++;
       }
+
       ok(res, { uploaded: count });
     } catch (e) {
       console.error('[POST IMAGES UPLOAD]', e);
