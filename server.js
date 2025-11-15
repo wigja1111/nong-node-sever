@@ -14,6 +14,7 @@ import multer from 'multer';
 import { randomUUID, createHash } from 'crypto';
 import fs from 'fs';
 import path from 'path';
+import sharp from 'sharp';
 
 
 // -------------------- Config --------------------
@@ -88,7 +89,34 @@ const upload = multer({
     cb(null, true);
   },
 });
+// ★ 500KB 이상이면 jpeg로 다시 인코딩해서 500KB 이하로 줄이는 헬퍼
+const IMAGE_MAX_BYTES = 500 * 1024;
 
+async function downsizeDiskImage(file) {
+  if (!file) return;
+  if (!file.size || file.size <= IMAGE_MAX_BYTES) return;
+
+  // multer.diskStorage가 설정한 실제 파일 경로
+  const filePath = file.path || path.join(uploadRoot, file.filename);
+
+  const qualities = [80, 70, 60, 50, 40, 30];
+
+  for (const q of qualities) {
+    const buf = await sharp(filePath)
+      .rotate() // EXIF 회전 보정
+      .jpeg({ quality: q, mozjpeg: true })
+      .toBuffer();
+
+    if (buf.length <= IMAGE_MAX_BYTES || q === qualities[qualities.length - 1]) {
+      // 파일 덮어쓰기
+      fs.writeFileSync(filePath, buf);
+      // multer file 객체 정보도 업데이트
+      file.size = buf.length;
+      file.mimetype = 'image/jpeg';
+      return;
+    }
+  }
+}
 // 게시글 이미지용 디스크 저장 multer
 const imageStorage = multer.diskStorage({
   destination(_req, _file, cb) {
@@ -587,12 +615,18 @@ app.get('/categories', async (_req, res) => {
 app.post(
   '/posts',
   authRequired,
-  uploadImages.array('images', cfg.maxImageFiles), // ★ 여기 multer 변경
+  uploadImages.array('images', cfg.maxImageFiles),
   async (req, res) => {
     const { cat_id, content, priority = 0 } = req.body || {};
     if (!content) return fail(res, 400, 'content required');
 
     const images = req.files || [];
+
+    // ★ 업로드된 게시글 이미지들 500KB 이하로 리사이즈/압축
+    if (images.length) {
+      await Promise.all(images.map((f) => downsizeDiskImage(f)));
+    }
+
     const p = ensurePool();
     const conn = await p.getConnection();
     try {
@@ -613,10 +647,11 @@ app.post(
           'INSERT INTO post_images (img_post_id, img_mime, img_size, img_path) VALUES (?, ?, ?, ?)';
         for (const f of images) {
           if (!f.mimetype?.startsWith('image/')) continue;
-          const relPath = f.filename; // uploads 폴더 안 파일명만 저장
+          const relPath = f.filename;
           await conn.execute(q, [postId, f.mimetype, f.size, relPath]);
         }
       }
+
       await conn.commit();
       ok(res, { post_id: postId, images_uploaded: images.length });
    } catch (e) {
@@ -896,7 +931,7 @@ app.post(
   adminOrOwner(async (req) => {
     // ...
   }),
-  uploadImages.array('images', cfg.maxImageFiles), // ★ multer 변경
+  uploadImages.array('images', cfg.maxImageFiles),
   async (req, res) => {
     const postId = Number(req.params.id);
     // ...
@@ -905,6 +940,9 @@ app.post(
     if (!files.length) {
       return fail(res, 400, 'no images uploaded');
     }
+
+    // ★ 추가 업로드 이미지들도 500KB 이하로 줄이기
+    await Promise.all(files.map((f) => downsizeDiskImage(f)));
 
     const p = ensurePool();
     const conn = await p.getConnection();
@@ -923,6 +961,7 @@ app.post(
         ]);
         count++;
       }
+
 
       ok(res, { uploaded: count });
     } catch (e) {
