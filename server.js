@@ -89,33 +89,50 @@ const upload = multer({
     cb(null, true);
   },
 });
-// ★ 500KB 이상이면 jpeg로 다시 인코딩해서 500KB 이하로 줄이는 헬퍼
+// ★ 게시글 이미지 리사이즈 + 압축 헬퍼 (약 100KB 이하 목표)
 const IMAGE_MAX_BYTES = 100 * 1024;
+const IMAGE_MAX_WIDTH = 1280;
+const IMAGE_MAX_HEIGHT = 1280;
 
 async function downsizeDiskImage(file) {
   if (!file) return;
+  // 이미 충분히 작으면 건너뜀
   if (!file.size || file.size <= IMAGE_MAX_BYTES) return;
 
   // multer.diskStorage가 설정한 실제 파일 경로
   const filePath = file.path || path.join(uploadRoot, file.filename);
 
-  const qualities = [80, 70, 60, 50, 40, 30, 20];
+  // 1차: 해상도 줄이고 q=70으로 한 번 인코딩
+  let buf = await sharp(filePath)
+    .rotate()
+    .resize({
+      width: IMAGE_MAX_WIDTH,
+      height: IMAGE_MAX_HEIGHT,
+      fit: 'inside',
+      withoutEnlargement: true,
+    })
+    .jpeg({ quality: 70, mozjpeg: true })
+    .toBuffer();
 
-  for (const q of qualities) {
-    const buf = await sharp(filePath)
-      .rotate() // EXIF 회전 보정
-      .jpeg({ quality: q, mozjpeg: true })
+  // 2차: 아직도 크면 q=50으로 한 번 더 시도
+  if (buf.length > IMAGE_MAX_BYTES) {
+    buf = await sharp(filePath)
+      .rotate()
+      .resize({
+        width: IMAGE_MAX_WIDTH,
+        height: IMAGE_MAX_HEIGHT,
+        fit: 'inside',
+        withoutEnlargement: true,
+      })
+      .jpeg({ quality: 50, mozjpeg: true })
       .toBuffer();
-
-    if (buf.length <= IMAGE_MAX_BYTES || q === qualities[qualities.length - 1]) {
-      // 파일 덮어쓰기
-      fs.writeFileSync(filePath, buf);
-      // multer file 객체 정보도 업데이트
-      file.size = buf.length;
-      file.mimetype = 'image/jpeg';
-      return;
-    }
   }
+
+  // 파일 덮어쓰기
+  fs.writeFileSync(filePath, buf);
+  // multer file 객체 정보도 업데이트
+  file.size = buf.length;
+  file.mimetype = 'image/jpeg';
 }
 // 게시글 이미지용 디스크 저장 multer
 const imageStorage = multer.diskStorage({
