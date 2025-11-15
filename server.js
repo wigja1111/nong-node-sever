@@ -90,7 +90,7 @@ const upload = multer({
   },
 });
 // ★ 500KB 이상이면 jpeg로 다시 인코딩해서 500KB 이하로 줄이는 헬퍼
-const IMAGE_MAX_BYTES = 500 * 1024;
+const IMAGE_MAX_BYTES = 100 * 1024;
 
 async function downsizeDiskImage(file) {
   if (!file) return;
@@ -99,7 +99,7 @@ async function downsizeDiskImage(file) {
   // multer.diskStorage가 설정한 실제 파일 경로
   const filePath = file.path || path.join(uploadRoot, file.filename);
 
-  const qualities = [80, 70, 60, 50, 40, 30];
+  const qualities = [80, 70, 60, 50, 40, 30, 20];
 
   for (const q of qualities) {
     const buf = await sharp(filePath)
