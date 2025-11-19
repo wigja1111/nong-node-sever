@@ -303,18 +303,21 @@ async function initSchema() {
     );
     await conn.query(`USE \`${cfg.dbName}\``);
 
-    await conn.query(
+        await conn.query(
       `CREATE TABLE IF NOT EXISTS \`users\` (
         \`user_id\`       INT UNSIGNED NOT NULL AUTO_INCREMENT,
         \`user_name\`     VARCHAR(50)  NOT NULL,
         \`user_email\`    VARCHAR(120) NOT NULL,
+        \`user_kakao_id\` BIGINT UNSIGNED NULL,
         \`user_password\` VARCHAR(255) NOT NULL,
         \`user_role\`     ENUM('user','admin') NOT NULL DEFAULT 'user',
         \`created_at\`    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY (\`user_id\`),
-        UNIQUE KEY \`uk_user_email\` (\`user_email\`)
+        UNIQUE KEY \`uk_user_email\` (\`user_email\`),
+        UNIQUE KEY \`uk_user_kakao\` (\`user_kakao_id\`)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`
     );
+
     await conn.query(
       `CREATE TABLE IF NOT EXISTS \`users\` (
         \`user_id\`       INT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -336,6 +339,26 @@ async function initSchema() {
     } catch (e) {
       if (e.code !== 'ER_DUP_FIELDNAME') {
         console.warn('[users MIGRATE user_kakao_id]', e.message || e);
+      }
+    }
+    // 🔹 기존 users 테이블에 user_kakao_id 컬럼 없으면 추가 (마이그레이션)
+    try {
+      await conn.query(
+        'ALTER TABLE `users` ADD COLUMN `user_kakao_id` BIGINT UNSIGNED NULL AFTER `user_email`'
+      );
+    } catch (e) {
+      if (e.code !== 'ER_DUP_FIELDNAME') {
+        console.warn('[users MIGRATE user_kakao_id]', e.message || e);
+      }
+    }
+
+    try {
+      await conn.query(
+        'ALTER TABLE `users` ADD UNIQUE KEY `uk_user_kakao` (`user_kakao_id`)'
+      );
+    } catch (e) {
+      if (e.code !== 'ER_DUP_KEYNAME') {
+        console.warn('[users MIGRATE uk_user_kakao]', e.message || e);
       }
     }
 
@@ -706,6 +729,131 @@ app.post('/auth/kakao', authLimiter, async (req, res) => {
       await conn.commit();
 
       // 3) JWT 발급 (기존 /auth/login 과 동일 형식)
+      const token = jwt.sign(
+        {
+          id: userRow.user_id,
+          role: userRow.user_role,
+          name: userRow.user_name,
+        },
+        cfg.jwtSecret,
+        { expiresIn: '7d' }
+      );
+
+      return ok(res, {
+        token,
+        user: {
+          id: userRow.user_id,
+          name: userRow.user_name,
+          role: userRow.user_role,
+        },
+      });
+    } catch (e) {
+      try {
+        await conn.rollback();
+      } catch {}
+      console.error('[AUTH KAKAO DB ERROR]', e);
+      return fail(res, 500, 'LOGIN_FAILED');
+    } finally {
+      conn.release();
+    }
+  } catch (e) {
+    console.error('[AUTH KAKAO ERROR]', e);
+    return fail(res, 500, 'KAKAO_LOGIN_ERROR');
+  }
+});
+app.post('/auth/kakao', authLimiter, async (req, res) => {
+  const { accessToken } = req.body || {};
+  if (!accessToken) return fail(res, 400, 'accessToken required');
+
+  try {
+    // 1) Kakao에 토큰 검증 + 유저 정보 요청
+    const kakaoRes = await fetch('https://kapi.kakao.com/v2/user/me', {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+      },
+    });
+
+    if (!kakaoRes.ok) {
+      console.error('[KAKAO ME ERROR]', kakaoRes.status);
+      return fail(res, 401, 'KAKAO_TOKEN_INVALID');
+    }
+
+    const data = await kakaoRes.json();
+    const kakaoId = data.id;
+    if (!kakaoId) {
+      return fail(res, 400, 'KAKAO_ID_MISSING');
+    }
+
+    const kakaoAccount = data.kakao_account || {};
+    const profile = kakaoAccount.profile || {};
+    const emailRaw = kakaoAccount.email;
+    const nickname =
+      profile.nickname ||
+      (emailRaw ? emailRaw.split('@')[0] : `kakao_${kakaoId}`);
+
+    let email = emailRaw || null;
+
+    const p = ensurePool();
+    const conn = await p.getConnection();
+
+    try {
+      await conn.beginTransaction();
+
+      let userRow = null;
+
+      // 2-1) Kakao ID로 먼저 찾기
+      const [byKakao] = await conn.query(
+        'SELECT user_id,user_name,user_email,user_role FROM users WHERE user_kakao_id=?',
+        [kakaoId]
+      );
+      if (byKakao.length) {
+        userRow = byKakao[0];
+      } else {
+        // 2-2) 이메일 있으면 기존 계정과 연결 시도
+        if (email) {
+          const [byEmail] = await conn.query(
+            'SELECT user_id,user_name,user_email,user_role FROM users WHERE user_email=?',
+            [email]
+          );
+          if (byEmail.length) {
+            userRow = byEmail[0];
+            await conn.execute(
+              'UPDATE users SET user_kakao_id=? WHERE user_id=?',
+              [kakaoId, userRow.user_id]
+            );
+          }
+        }
+
+        // 2-3) 아무 것도 없으면 새 계정 생성
+        if (!userRow) {
+          if (!email) {
+            // 이메일 권한 안 준 경우 더미 이메일
+            email = `kakao-${kakaoId}@kakao.local`;
+          }
+
+          const randomPass = randomUUID();
+          const hash = await bcrypt.hash(randomPass, cfg.bcryptRounds);
+
+          const [r] = await conn.execute(
+            `INSERT INTO users
+             (user_name,user_email,user_password,user_role,user_kakao_id)
+             VALUES (?,?,?,?,?)`,
+            [nickname, email, hash, 'user', kakaoId]
+          );
+
+          userRow = {
+            user_id: r.insertId,
+            user_name: nickname,
+            user_email: email,
+            user_role: 'user',
+          };
+        }
+      }
+
+      await conn.commit();
+
+      // 3) JWT 발급 (기존 /auth/login 이랑 동일 포맷)
       const token = jwt.sign(
         {
           id: userRow.user_id,
