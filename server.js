@@ -1802,6 +1802,7 @@ app.get('/notifications', authRequired, async (req, res) => {
   }
 });
 // 현재 로그인한 유저 정보 조회
+// 현재 로그인한 유저 정보 조회
 app.get('/users/me', authRequired, async (req, res) => {
   const uid = Number(req.user.id ?? req.user.uid);
 
@@ -1813,8 +1814,9 @@ app.get('/users/me', authRequired, async (req, res) => {
   const conn = await p.getConnection();
 
   try {
+    // 🔥 user_email 까지 같이 조회
     const [[row]] = await conn.query(
-      'SELECT user_id, user_name FROM users WHERE user_id = ?',
+      'SELECT user_id, user_name, user_email FROM users WHERE user_id = ?',
       [uid]
     );
 
@@ -1822,11 +1824,13 @@ app.get('/users/me', authRequired, async (req, res) => {
       return fail(res, 404, 'USER_NOT_FOUND');
     }
 
-    // ok() 헬퍼: { ok: true, ... } 형태로 응답
+    // Flutter 쪽에서 user['user_email'] 또는 user['email'] 둘 다 인식 가능하게 내려줌
     return ok(res, {
       user: {
         id: row.user_id,
         name: row.user_name,
+        email: row.user_email,       // Flutter: user['email']
+        user_email: row.user_email,  // Flutter: user['user_email']
       },
     });
   } catch (e) {
@@ -1836,6 +1840,7 @@ app.get('/users/me', authRequired, async (req, res) => {
     conn.release();
   }
 });
+
 
 app.get('/users/me/settings', authRequired, async (req, res) => {
   const uid = Number(req.user.id ?? req.user.uid);
