@@ -873,6 +873,22 @@ app.get('/posts', async (req, res) => {
       params.push(Number(authed.id));
     }
 
+    // ✅ (2) "+q+w+e" 포함 글 제외
+    where += " AND p.post_content NOT LIKE '%+q+w+e%' ";
+
+    // ✅ (3) able = 1 인 글만 (컬럼 존재 가정)
+    where += ' AND p.able = 1 ';
+
+    // ✅ (4)(5) 날짜 필터
+    //  updated_at != NULL → updated_at < NOW()
+    //  updated_at == NULL → created_at < NOW()
+    where += `
+      AND (
+        (p.updated_at IS NOT NULL AND p.updated_at < NOW())
+        OR (p.updated_at IS NULL AND p.created_at < NOW())
+      )
+    `;
+
     const likeUserId = authed?.id ? Number(authed.id) : 0;
 
     const sql = `
@@ -883,6 +899,8 @@ app.get('/posts', async (req, res) => {
         p.post_like,
         p.created_at,
         p.updated_at,
+        /* 필요하면 아래 줄처럼 able까지 내려보내도 됨 */
+        /* p.able, */
         u.user_id,
         u.user_name,
         c.cat_id,
@@ -901,13 +919,13 @@ app.get('/posts', async (req, res) => {
       LIMIT ? OFFSET ?
     `;
 
-    params.unshift(likeUserId); // pl.pl_user_id 바인딩
+    params.unshift(likeUserId);
     params.push(limit, offset);
 
     const [rows] = await conn.execute(sql, params);
 
-    // 🔹 여기서 각 post_id에 연결된 이미지 URL들을 붙여준다.
-        const postIds = rows.map((r) => r.post_id);
+    // 아래 이미지는 그대로 유지
+    const postIds = rows.map((r) => r.post_id);
     let imgsByPost = {};
 
     if (postIds.length > 0) {
@@ -919,7 +937,6 @@ app.get('/posts', async (req, res) => {
       for (const img of imgs) {
         const pid = img.img_post_id;
         if (!imgsByPost[pid]) imgsByPost[pid] = [];
-        // 이제는 정적 /uploads/ 경로로 바로 접근
         imgsByPost[pid].push(`/${cfg.uploadDir}/${img.img_path}`);
       }
     }
@@ -928,7 +945,6 @@ app.get('/posts', async (req, res) => {
       ...row,
       img_urls: imgsByPost[row.post_id] || [],
     }));
-
 
     ok(res, {
       rows: rowsWithImages,
