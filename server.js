@@ -944,7 +944,7 @@ app.get('/posts', async (req, res) => {
     where += " AND p.post_content NOT LIKE '%+q+w+e%' ";
 
     // ✅ (3) able = 1 인 글만 (컬럼 존재 가정)
-    where += ' AND p.post_able = 1 ';
+    where += ' AND p.able = 1 ';
 
     // ✅ (4)(5) 날짜 필터
     //  updated_at != NULL → updated_at < NOW()
