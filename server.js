@@ -40,7 +40,7 @@ if (!fs.existsSync(uploadRoot)) {
 }
 
 // 🔹 회원가입 시 사용할 기본 프로필 이미지(BLOB)
-const defaultAvatarPath = path.join(process.cwd(), 'default_avatar.jpg'); // 서버 폴더에 저장
+const defaultAvatarPath = path.join(process.cwd(), 'assets/default_avatar.jpg'); // 서버 폴더에 저장
 let defaultAvatarBuffer = null;
 let defaultAvatarMime = 'image/jpeg'; // png 쓰면 image/png 로 바꾸기
 
@@ -747,7 +747,27 @@ app.post('/auth/kakao', authLimiter, async (req, res) => {
             user_email: email,
             user_role: 'user',
           };
-        }
+           // ✅ 카카오 신규 유저에도 기본 아바타 삽입
+                  if (defaultAvatarBuffer) {
+                    try {
+                      await conn.execute(
+                        `INSERT INTO user_avatars (ua_user_id, ua_mime, ua_size, ua_data)
+                        VALUES (?, ?, ?, ?)`,
+                        [
+                          userRow.user_id,
+                          defaultAvatarMime,
+                          defaultAvatarBuffer.length,
+                          defaultAvatarBuffer,
+                        ]
+                      );
+                    } catch (e) {
+                      console.warn(
+                        '[KAKAO SIGNUP][AVATAR INSERT FAIL]',
+                        e?.message || String(e)
+                      );
+                    }
+                  }
+                }
       }
 
       await conn.commit();
@@ -909,10 +929,16 @@ app.get('/posts', async (req, res) => {
       params.push(Number(cat_id));
     }
 
-    if (me && authed?.id) {
-      where += ' AND p.post_user_id=? ';
-      params.push(Number(authed.id));
-    }
+    if (me) {
+  // me=1인데 토큰이 없거나, verify 실패해서 authed가 없으면 → 로그인 필요
+  if (!authed?.id) {
+    return fail(res, 401, 'INVALID_TOKEN');
+  }
+
+  // 토큰이 유효하면 내 글만 필터링
+  where += ' AND p.post_user_id=? ';
+  params.push(Number(authed.id));
+}
 
     // ✅ (2) "+q+w+e" 포함 글 제외
     where += " AND p.post_content NOT LIKE '%+q+w+e%' ";
