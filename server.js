@@ -944,7 +944,7 @@ app.get('/posts', async (req, res) => {
     where += " AND p.post_content NOT LIKE '%+q+w+e%' ";
 
     // ✅ (3) able = 1 인 글만 (컬럼 존재 가정)
-    where += ' AND p.able = 1 ';
+    where += ' AND p.post_able = 1 ';
 
     // ✅ (4)(5) 날짜 필터
     //  updated_at != NULL → updated_at < NOW()
@@ -1957,26 +1957,48 @@ app.put('/users/me/settings', authRequired, async (req, res) => {
   const conn = await p.getConnection();
 
   try {
-    console.log('[USER SETTINGS][PUT]', {
-      uid,
-      nickname,
-    });
+    console.log('[USER SETTINGS][PUT]', { uid, nickname });
 
     const trimmed =
-      typeof nickname === 'string' ? nickname.trim() : null;
+      typeof nickname === 'string' ? nickname.trim() : '';
 
     // 닉네임 안 들어왔으면 에러
     if (!trimmed) {
       return fail(res, 400, 'nickname is required');
     }
 
-    // 1) 중복 체크: users.user_name에 같은 값이 다른 유저에 있는지
+    await conn.beginTransaction();
+
+    // 0) 유저 존재 여부 먼저 확인
+    const [[user]] = await conn.query(
+      'SELECT user_id, user_name FROM users WHERE user_id = ?',
+      [uid]
+    );
+
+    if (!user) {
+      await conn.rollback();
+      console.warn('[NICKNAME UPDATE][NO USER]', { uid, nickname: trimmed });
+      return fail(res, 400, 'invalid user id');
+    }
+
+    // 1) 기존 닉네임과 동일하면 → 굳이 UPDATE 안 하고 그대로 성공 처리
+    if (user.user_name === trimmed) {
+      console.log('[NICKNAME UPDATE][SAME AS BEFORE]', {
+        uid,
+        nickname: trimmed,
+      });
+      await conn.commit();
+      return ok(res, { updated: false, nickname: trimmed });
+    }
+
+    // 2) 중복 체크: 다른 유저가 같은 닉네임 쓰는지
     const [dups] = await conn.query(
       'SELECT user_id FROM users WHERE user_name = ? AND user_id <> ? LIMIT 1',
       [trimmed, uid]
     );
 
     if (dups.length) {
+      await conn.rollback();
       console.warn('[NICKNAME DUP]', {
         uid,
         nickname: trimmed,
@@ -1990,45 +2012,52 @@ app.put('/users/me/settings', authRequired, async (req, res) => {
       });
     }
 
-    // 2) 실제 업데이트: users.user_name
-    const [result] = await conn.execute(
+    // 3) 실제 업데이트: users.user_name
+    await conn.execute(
       'UPDATE users SET user_name = ? WHERE user_id = ?',
       [trimmed, uid]
     );
 
-    // 해당 유저가 없을 때
-    if (!result.affectedRows) {
-      console.warn('[NICKNAME UPDATE][NO USER]', { uid, nickname: trimmed });
-      return fail(res, 400, 'invalid user id');
-    }
+    // (선택) user_settings.us_nickname도 같이 맞춰주기
+    await conn.execute(
+      `INSERT INTO user_settings (us_user_id, us_nickname)
+       VALUES (?, ?)
+       ON DUPLICATE KEY UPDATE us_nickname = VALUES(us_nickname)`,
+      [uid, trimmed]
+    );
 
-    console.log('[NICKNAME UPDATED]', {
-      uid,
-      nickname: trimmed,
-    });
+    await conn.commit();
 
+    console.log('[NICKNAME UPDATED]', { uid, nickname: trimmed });
     return ok(res, { updated: true, nickname: trimmed });
   } catch (e) {
-  console.error('[USER SETTINGS][ERROR]', e?.code, e?.errno, e?.sqlMessage || e?.message);
+    console.error(
+      '[USER SETTINGS][ERROR]',
+      e?.code,
+      e?.errno,
+      e?.sqlMessage || e?.message
+    );
 
-  // 상황별로 어떤 문제인지 바로 알 수 있게
-  if (e.code === 'ER_NO_SUCH_TABLE') {
-    return fail(res, 500, 'user_settings table missing');
-  }
-  if (e.code === 'ER_BAD_FIELD_ERROR') {
-    return fail(res, 500, 'invalid column in user_settings query');
-  }
-  if (e.code === 'ER_NO_REFERENCED_ROW_2') {
-    // FK: users에 없는 uid로 insert하려고 할 때
-    return fail(res, 400, 'invalid user id for settings');
-  }
+    try {
+      await conn.rollback();
+    } catch (_) {}
 
-  return fail(res, 500, 'failed');
-} finally {
-  conn.release();
-}
+    if (e.code === 'ER_NO_SUCH_TABLE') {
+      return fail(res, 500, 'user_settings table missing');
+    }
+    if (e.code === 'ER_BAD_FIELD_ERROR') {
+      return fail(res, 500, 'invalid column in user_settings query');
+    }
+    if (e.code === 'ER_NO_REFERENCED_ROW_2') {
+      return fail(res, 400, 'invalid user id for settings');
+    }
 
+    return fail(res, 500, 'failed');
+  } finally {
+    conn.release();
+  }
 });
+
 
 
 // 내 이름(user_name) 변경
