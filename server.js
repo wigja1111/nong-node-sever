@@ -39,6 +39,22 @@ if (!fs.existsSync(uploadRoot)) {
   fs.mkdirSync(uploadRoot, { recursive: true });
 }
 
+// 🔹 회원가입 시 사용할 기본 프로필 이미지(BLOB)
+const defaultAvatarPath = path.join(process.cwd(), 'default_avatar.jpg'); // 서버 폴더에 저장
+let defaultAvatarBuffer = null;
+let defaultAvatarMime = 'image/jpeg'; // png 쓰면 image/png 로 바꾸기
+
+try {
+  defaultAvatarBuffer = fs.readFileSync(defaultAvatarPath);
+  console.log('[AVATAR] default avatar loaded', {
+    path: defaultAvatarPath,
+    bytes: defaultAvatarBuffer.length,
+  });
+} catch (e) {
+  console.warn('[AVATAR] default avatar not loaded:', e.message);
+}
+
+
 
 console.log('[BOOT CONFIG]', {
   DB_HOST: cfg.dbHost,
@@ -547,7 +563,7 @@ app.post('/auth/signup', authLimiter, async (req, res) => {
   if (password.length < 8)
     return fail(res, 400, 'Password must be at least 8 chars');
 
-  const p = ensurePool();
+ const p = ensurePool();
   const conn = await p.getConnection();
   try {
     const [dups] = await conn.execute(
@@ -561,7 +577,32 @@ app.post('/auth/signup', authLimiter, async (req, res) => {
       'INSERT INTO users (user_name, user_email, user_password, user_role) VALUES (?, ?, ?, ?)',
       [name, email, hash, 'user']
     );
-    ok(res, { user_id: r.insertId });
+
+    const newUserId = r.insertId;
+
+    // 🔹 기본 프로필 이미지가 로드돼 있으면 user_avatars 에 저장
+    if (defaultAvatarBuffer) {
+      try {
+        await conn.execute(
+          `INSERT INTO user_avatars (ua_user_id, ua_mime, ua_size, ua_data)
+           VALUES (?, ?, ?, ?)`,
+          [
+            newUserId,
+            defaultAvatarMime,
+            defaultAvatarBuffer.length,
+            defaultAvatarBuffer,
+          ]
+        );
+      } catch (e) {
+        console.warn(
+          '[SIGNUP][AVATAR INSERT FAIL]',
+          e?.message || String(e)
+        );
+        // 아바타 저장 실패해도 회원가입은 그대로 진행
+      }
+    }
+
+    ok(res, { user_id: newUserId });
   } catch (e) {
     console.error('[SIGNUP]', e);
     fail(res, 500, 'Signup failed');
@@ -1114,12 +1155,22 @@ app.post(
   '/posts/:id/images',
   authRequired,
   adminOrOwner(async (req) => {
-    // ...
+    // 이 게시글의 작성자 ID 반환 (PUT /posts/:id 와 동일한 방식)
+    const p = ensurePool();
+    const conn = await p.getConnection();
+    try {
+      const [[row]] = await conn.query(
+        'SELECT post_user_id FROM posts WHERE post_id=?',
+        [req.params.id]
+      );
+      return row?.post_user_id;
+    } finally {
+      conn.release();
+    }
   }),
   uploadImages.array('images', cfg.maxImageFiles),
   async (req, res) => {
     const postId = Number(req.params.id);
-    // ...
 
     const files = req.files || [];
     if (!files.length) {
@@ -1147,7 +1198,6 @@ app.post(
         count++;
       }
 
-
       ok(res, { uploaded: count });
     } catch (e) {
       console.error('[POST IMAGES UPLOAD]', e);
@@ -1157,6 +1207,7 @@ app.post(
     }
   }
 );
+
 // 게시글 이미지 삭제
 app.delete(
   '/posts/:id/images/:imgId',
